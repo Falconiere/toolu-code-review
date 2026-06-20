@@ -77,8 +77,8 @@ OpenAI-compatible:
 - uses: falconiere/toolu-ghactions/code-review@v2
   with:
     OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-    MODEL: 'anthropic/claude-sonnet-4-5'   # default: google/gemini-2.5-flash
-    MAX_TOKENS: '8192'                      # per-request completion budget (default 4096)
+    MODEL: 'anthropic/claude-sonnet-4-5'   # default: deepseek/deepseek-v4-pro
+    MAX_TOKENS: '16384'                     # per-request completion budget (default 8192)
 ```
 
 `MODEL` is an OpenRouter model id — `openai/gpt-4o`, `anthropic/claude-sonnet-4-5`,
@@ -387,8 +387,8 @@ turn the recap and history off.
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `OPENROUTER_API_KEY` | no | — | OpenRouter API key. The model runs through OpenRouter. Prefer passing via a step-level `env:` block for secret hygiene. |
-| `MODEL` | no | `google/gemini-2.5-flash` | OpenRouter model id (any OpenAI-compatible model, e.g. `anthropic/claude-sonnet-4-5`, `google/gemini-2.5-flash`). Pick one with reliable JSON-schema structured output. |
-| `MAX_TOKENS` | no | `4096` | Max completion tokens per request. |
+| `MODEL` | no | `deepseek/deepseek-v4-pro` | OpenRouter model id (any OpenAI-compatible model, e.g. `anthropic/claude-sonnet-4-5`, `google/gemini-2.5-flash`). The default has a 1M-token context and 384k max output, so large diffs and verbose reviews rarely truncate. Pick one with reliable JSON-schema structured output. |
+| `MAX_TOKENS` | no | `8192` | Max completion-token budget per request (always sent — omitting it makes OpenRouter reserve the model's full output window against your credits and can 402-reject). A response truncated at this limit (`finish_reason: length`) is retried with a doubled budget up to 32768; if it still truncates, the findings completed before the cut are salvaged. |
 | `MIN_CONFIDENCE` | no | `high` | Drop findings below this confidence unless severity is blocker/high (`high` or `medium`) |
 | `INLINE_COMMENTS` | no | `true` | Post per-line review comments with committable code suggestions (Reviews API), in addition to the summary comment |
 | `MANAGE_LABELS` | no | `true` | Set a real PR label chip matching the verdict (`merge-approved` / `request-changes`) and remove the opposite one. Requires `issues: write`. |
@@ -421,10 +421,10 @@ Still accepted so existing workflows don't break, but ignored (warned in logs). 
 | Input | Default | Status |
 |---|---|---|
 | `PROVIDERS` | — | **Deprecated.** Only the first entry's `model` (+ optional `api_key` / `max_tokens`) is used; `provider` is accepted-but-ignored; extra entries dropped. Use `OPENROUTER_API_KEY` + `MODEL`. |
-| `MERGE_STRATEGY` | `conservative` | **Deprecated — no-op.** One model means one verdict; nothing to merge. |
+| `MERGE_STRATEGY` | — | **Deprecated — no-op.** One model means one verdict; nothing to merge. |
 | `ENFORCE_JSON_SCHEMA` | `true` | **Deprecated — no-op.** `generateObject` is always structured; there is no free-text/regex path. |
-| `FALLBACK_MODEL` | `anthropic/claude-sonnet-4-5` | **Deprecated — no-op.** No fallback array; set `MODEL` instead. |
-| `REVIEW_MODE` | `parallel` | **Deprecated — no-op.** The per-dimension sub-reviewer was removed. |
+| `FALLBACK_MODEL` | — | **Deprecated — no-op.** No fallback array; set `MODEL` instead. |
+| `REVIEW_MODE` | — | **Deprecated — no-op.** The per-dimension sub-reviewer was removed. |
 
 ## Outputs
 

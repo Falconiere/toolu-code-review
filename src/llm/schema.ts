@@ -19,7 +19,16 @@ export const Finding = z.object({
   category: z.string().optional(),
   confidence: z.enum(["high", "medium"]).optional(),
   quoted_line: z.string().optional(),
-  suggestion: z.string().optional(),
+  suggestion: z
+    .string()
+    .optional()
+    .describe(
+      "Replacement CODE ONLY — the exact source text to substitute for lines " +
+        "[line..end_line]. GitHub renders it as a committable 'Suggested change', so " +
+        "it must be literal, directly-applicable code, never prose, commentary, or an " +
+        "instruction like 'remove this line'. Explanations go in `text`. Omit this " +
+        "field entirely when there is no clean code replacement.",
+    ),
   // Provenance: which layer surfaced this finding. Absent → an LLM-discovered finding
   // (rendered as "llm"); set to a tool name when the model confirms a deterministic
   // (gitleaks/opengrep) finding it was asked to triage.
@@ -28,17 +37,47 @@ export const Finding = z.object({
 });
 
 /**
- * The full review verdict object. Required keys match build-request.sh's
- * SCHEMA.schema.required: review_plan, verdict, findings, other_checks,
- * top_must_fix. `verdict` is the two-value enum (approved | changes) — the
- * provider layer adds the third "error" state on abstention, never the model.
+ * The full review verdict object. `verdict` is the two-value enum
+ * (approved | changes) — the provider layer adds the third "error" state on
+ * abstention, never the model.
+ *
+ * Field order and required-ness are deliberate for truncation resilience: the
+ * model emits `review_plan` (a bounded plan), then `verdict`, then the unbounded
+ * `findings` array. A length-truncated response almost always cuts off INSIDE
+ * `findings`, so the fields emitted AFTER it — `other_checks`, `top_must_fix` —
+ * are optional with defaults. That lets a JSON-repaired/partial response still
+ * validate, so the findings completed before the cut survive instead of the whole
+ * chunk being lost.
  */
 export const Verdict = z.object({
-  review_plan: z.string(),
+  // Bounded: review_plan is emitted FIRST, so an unbounded plan eats the output
+  // budget before findings and starves them under truncation. The prompt asks for
+  // ≤ 2 short sentences (≤ 280 chars) and the JSON-schema maxLength nudges the model,
+  // but in JSON mode the provider only receives response_format:{type:"json_object"} —
+  // the schema (hence maxLength) is NOT enforced during decoding. So the cap is a soft
+  // backstop: an over-length plan is TRUNCATED via .catch rather than failing
+  // validation, which would otherwise throw the whole (complete, valid) review away as
+  // an abstention.
+  review_plan: z
+    .string()
+    .max(280)
+    .catch(({ input }) => (typeof input === "string" ? input.slice(0, 280) : "")),
   verdict: z.enum(["approved", "changes"]),
   findings: z.array(Finding),
-  other_checks: z.string(),
-  top_must_fix: z.array(z.string()),
+  other_checks: z.string().default(""),
+  top_must_fix: z.array(z.string()).default([]),
+});
+
+/**
+ * Loose shape for salvaging a length-truncated response: only the fields that may
+ * survive a mid-JSON cut, all optional. `findings` stays `unknown[]` so each element
+ * is validated INDIVIDUALLY against {@link Finding} — the incomplete trailing one is
+ * dropped while the finished ones survive.
+ */
+export const PartialVerdict = z.object({
+  review_plan: z.string().optional(),
+  verdict: z.enum(["approved", "changes"]).optional(),
+  findings: z.array(z.unknown()).optional(),
 });
 
 /** A review finding, inferred from the {@link Finding} schema. */

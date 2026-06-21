@@ -31,6 +31,36 @@ afterEach(() => {
   Object.assign(process.env, savedEnv);
 });
 
+describe("REQUEST_TIMEOUT_MS — per-attempt model deadline", () => {
+  it("defaults to 180000ms (3 min) when unset — generous for the slow default model", () => {
+    expect(readInputs().requestTimeoutMs).toBe(180000);
+  });
+
+  it("is overridable via the input", () => {
+    setInput("REQUEST_TIMEOUT_MS", "300000");
+    expect(readInputs().requestTimeoutMs).toBe(300000);
+  });
+
+  it('"0" falls back to the 180000 default with a warning (would abort instantly)', () => {
+    setInput("REQUEST_TIMEOUT_MS", "0");
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
+    expect(readInputs().requestTimeoutMs).toBe(180000);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("REQUEST_TIMEOUT_MS=0"));
+  });
+
+  it('"-5" (negative) falls back to 180000 with a warning', () => {
+    setInput("REQUEST_TIMEOUT_MS", "-5");
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
+    expect(readInputs().requestTimeoutMs).toBe(180000);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("REQUEST_TIMEOUT_MS=-5"));
+  });
+
+  it("a non-numeric value falls back to 180000 (intInput's own non-finite guard, silent)", () => {
+    setInput("REQUEST_TIMEOUT_MS", "not-a-number");
+    expect(readInputs().requestTimeoutMs).toBe(180000);
+  });
+});
+
 describe("FIX 8 — token budget must be positive", () => {
   it('MAX_TOKENS="0" falls back to the 8192 default with a warning', () => {
     setInput("MAX_TOKENS", "0");

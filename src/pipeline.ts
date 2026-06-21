@@ -16,8 +16,8 @@ import { fetchDiff } from "./git/diff.js";
 import { gatherRules } from "./rules.js";
 import { buildPrompt } from "./prompt.js";
 import { gatherMechanical } from "./mechanical/gather.js";
-import { reviewWithModel } from "./llm/openrouter.js";
-import type { ProviderResult } from "./llm/openrouter.js";
+import { reviewWithModel } from "./llm/reviewWithModel.js";
+import type { ProviderResult } from "./llm/reviewWithModel.js";
 import { reviewChunked } from "./review/chunked.js";
 import { validateFindings } from "./review/validate.js";
 import { renderRecapSection, renderHistorySection } from "./review/recap.js";
@@ -207,6 +207,7 @@ export async function runReview(deps: ReviewDeps): Promise<ReviewResult> {
       }),
     review: (envelope) =>
       reviewWithModel(envelope, {
+        provider: inputs.provider,
         model: inputs.model,
         apiKey: inputs.apiKey,
         timeoutMs: inputs.requestTimeoutMs,

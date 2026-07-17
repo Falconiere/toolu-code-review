@@ -12,7 +12,13 @@ import { runReview } from "@/pipeline.js";
 import type { GithubContext, PipelineOctokit, ReviewDeps } from "@/pipeline.js";
 import type { ActionInputs } from "@/inputs.js";
 import { parseFailOn, shouldBlock, type BlockableVerdict } from "@/review/gate.js";
-import { encodeMarker, fingerprint, type ReviewState } from "@/state.js";
+import {
+  decodeMarker,
+  encodeMarker,
+  extractMarker,
+  fingerprint,
+  type ReviewState,
+} from "@/state.js";
 import { appendFpMarker } from "@/review/fpmarker.js";
 import { git, setupGitRepo, writeFile, removeRepo } from "@/git/__tests__/helpers.js";
 
@@ -970,5 +976,214 @@ describe("FAIL_ON merge gate (real pipeline verdict + shouldBlock)", () => {
     expect(result.verdict).toBe("error");
     expect(shouldBlock(result.verdict, parseFailOn("changes,error"))).toBe(true);
     expect(shouldBlock(result.verdict, parseFailOn("changes"))).toBe(false);
+  });
+});
+
+describe("runReview — marker survives a cancelled run (cancel-in-progress safety)", () => {
+  it("the in-progress upsert body CARRIES the prior state marker", async () => {
+    // A rapid second push cancels the in-flight run via concurrency
+    // cancel-in-progress AFTER the sticky was overwritten with the in-progress
+    // body and BEFORE the final verdict restored the marker. If the in-progress
+    // body drops the marker, that cancellation wipes review memory: history
+    // reset, recap lost, MAX_ROUNDS counter back to zero (observed in prod as
+    // "resolves a round then invents a fresh batch"). The FIRST update posted
+    // must therefore already carry the prior marker.
+    const { dir, headSha } = track(featureRepoWithChange());
+    const priorState: ReviewState = {
+      schema: "toolu-review-state",
+      version: 1,
+      findings: [{ path: "src/util.ts", line: 2, text: "prior finding", fp: "abc" }],
+      history: [
+        {
+          sha: "1234567",
+          ts: 1_700_000_000,
+          verdict: "changes",
+          counts: { new: 1, open: 0, resolved: 0, total: 1 },
+        },
+      ],
+    };
+    const priorMarker = encodeMarker(priorState);
+    const { octokit, rec } = fakeOctokit([
+      { id: 777, body: `### Code Review — old\n\n${priorMarker}` },
+    ]);
+
+    await runReview({
+      inputs: baseInputs(),
+      octokit,
+      context: prContext(headSha),
+      fetch: replayFetch("success"),
+      cwd: dir,
+      now: () => 1_700_000_000_000,
+    });
+
+    // First update = the in-progress body. It must carry the prior marker VERBATIM.
+    const first = rec.updated[0];
+    expect(first?.comment_id).toBe(777);
+    expect(first?.body).toContain("PR Review in Progress");
+    expect(first?.body).toContain(priorMarker);
+
+    // And the final verdict body carries a (fresh) marker as always.
+    expect(rec.updated.at(-1)?.body).toContain("toolu-review-state:v1");
+  });
+
+  it("reviewMemory=false still carries the marker through the in-progress body", async () => {
+    // Memory off must not DESTROY state a future memory-on run would read.
+    const { dir, headSha } = track(featureRepoWithChange());
+    const priorMarker = encodeMarker({
+      schema: "toolu-review-state",
+      version: 1,
+      findings: [],
+      history: [],
+    });
+    const { octokit, rec } = fakeOctokit([
+      { id: 888, body: `### Code Review — old\n\n${priorMarker}` },
+    ]);
+
+    await runReview({
+      inputs: baseInputs({ reviewMemory: false }),
+      octokit,
+      context: prContext(headSha),
+      fetch: replayFetch("success"),
+      cwd: dir,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(rec.updated[0]?.body).toContain(priorMarker);
+  });
+
+  it("a FIRST run (no prior sticky, null marker) posts an in-progress body with no marker and no 'null'", async () => {
+    // priorMarker is null on round one — the body must not render a literal
+    // "null" or an empty marker line.
+    const { dir, headSha } = track(featureRepoWithChange());
+    const { octokit, rec } = fakeOctokit();
+
+    await runReview({
+      inputs: baseInputs(),
+      octokit,
+      context: prContext(headSha),
+      fetch: replayFetch("success"),
+      cwd: dir,
+      now: () => 1_700_000_000_000,
+    });
+
+    const first = rec.created[0];
+    expect(first?.body).toContain("PR Review in Progress");
+    expect(first?.body).not.toContain("null");
+    expect(first?.body).not.toContain("toolu-review-state:v1");
+  });
+});
+
+describe("runReview — incremental scope (natural convergence)", () => {
+  it("nothing changed since the last reviewed sha → a freshly invented finding cannot flip the verdict", async () => {
+    // Round N+1 with reviewed_sha == current head: the since-diff is EMPTY, so a
+    // generative model re-inventing findings about already-reviewed code has no
+    // scope to put them in. The verdict converges to approved with no surrender
+    // cap involved — the bot "stops when there are no issues on the changed files".
+    const { dir, headSha } = track(featureRepoWithChange());
+    const priorMarker = encodeMarker({
+      schema: "toolu-review-state",
+      version: 1,
+      findings: [],
+      history: [
+        {
+          sha: headSha.slice(0, 7),
+          ts: 1_700_000_000,
+          verdict: "changes",
+          counts: { new: 1, open: 0, resolved: 0, total: 1 },
+        },
+      ],
+      reviewed_sha: headSha,
+    });
+    const { octokit, rec } = fakeOctokit([
+      { id: 900, body: `### Code Review — old\n\n${priorMarker}` },
+    ]);
+
+    // The findings fixture flags src/util.ts:2 — a line in the PR diff, but NOT
+    // changed since the last reviewed sha (nothing is).
+    const result = await runReview({
+      inputs: baseInputs(),
+      octokit,
+      context: prContext(headSha),
+      fetch: replayFetch("findings"),
+      cwd: dir,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(result.verdict).toBe("approved");
+    expect(result.findingsCount).toBe(0);
+    expect(rec.addedLabels).toContainEqual(["merge-approved"]);
+    // No inline review posted for the dropped finding.
+    expect(rec.reviews).toEqual([]);
+    // The comment says out-of-scope findings were not re-raised.
+    expect(rec.updated.at(-1)?.body).toContain("Incremental review");
+  });
+
+  it("the same finding on a FIRST review (no reviewed_sha) still requests changes", async () => {
+    // Control: without a prior reviewed_sha the scope is null → full review, and
+    // the fixture's finding blocks as before. The filter only ever narrows
+    // RE-reviews; it can never weaken round one.
+    const { dir, headSha } = track(featureRepoWithChange());
+    const { octokit, rec } = fakeOctokit();
+
+    const result = await runReview({
+      inputs: baseInputs(),
+      octokit,
+      context: prContext(headSha),
+      fetch: replayFetch("findings"),
+      cwd: dir,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(result.verdict).toBe("changes");
+    expect(result.findingsCount).toBe(1);
+    expect(rec.addedLabels).toContainEqual(["request-changes"]);
+  });
+
+  it("the NEXT round's marker records this round's reviewed sha", async () => {
+    const { dir, headSha } = track(featureRepoWithChange());
+    const { octokit, rec } = fakeOctokit();
+
+    await runReview({
+      inputs: baseInputs(),
+      octokit,
+      context: prContext(headSha),
+      fetch: replayFetch("findings"),
+      cwd: dir,
+      now: () => 1_700_000_000_000,
+    });
+
+    const lastBody = rec.updated.at(-1)?.body ?? rec.created.at(-1)?.body ?? "";
+    const marker = extractMarker(lastBody);
+    expect(marker).not.toBeNull();
+    const state = decodeMarker(marker ?? "");
+    expect("reviewed_sha" in state && state.reviewed_sha).toBe(headSha);
+  });
+
+  it("records the PAYLOAD's PR head sha, not GITHUB_SHA (the test-merge commit)", async () => {
+    // On pull_request events GITHUB_SHA is the ephemeral test-merge commit,
+    // orphaned on every push — a series stored on it never resolves (or
+    // ancestor-checks) on the next run, silently disabling the incremental
+    // scope. The marker must converge on `.pull_request.head.sha`.
+    const { dir, headSha } = track(featureRepoWithChange());
+    const { octokit, rec } = fakeOctokit();
+    const ctx = prContext("1111111111111111111111111111111111111111");
+    ctx.payload = {
+      pull_request: { number: 7, base: { ref: "main" }, head: { sha: headSha } },
+    };
+
+    await runReview({
+      inputs: baseInputs(),
+      octokit,
+      context: ctx,
+      fetch: replayFetch("findings"),
+      cwd: dir,
+      now: () => 1_700_000_000_000,
+    });
+
+    const lastBody = rec.updated.at(-1)?.body ?? rec.created.at(-1)?.body ?? "";
+    const marker = extractMarker(lastBody);
+    expect(marker).not.toBeNull();
+    const state = decodeMarker(marker ?? "");
+    expect("reviewed_sha" in state && state.reviewed_sha).toBe(headSha);
   });
 });

@@ -3,9 +3,11 @@
 // truncate at a hunk boundary. Port of fetch-diff.sh, driving `git` via
 // execFileSync (not simple-git) so argv and exit-code handling match the bash.
 import { execFileSync } from "node:child_process";
+import { unquoteGitPath } from "./path.js";
 import { shapeDiff, type ShapedFile } from "./shape.js";
-import { noiseReason } from "./noise.js";
+import { noiseReason, LARGE_FILE_BYTES } from "./noise.js";
 import { anyGlobMatches } from "./globs.js";
+import { batchRead, type BlobSpec } from "./batchRead.js";
 
 /** A file dropped before diffing, with the reason it was classified as noise. */
 export interface DroppedFile {
@@ -81,10 +83,28 @@ export class DiffResolutionError extends Error {
   }
 }
 
+/**
+ * Force RAW (unescaped) non-ASCII bytes in every path git prints. Under git's
+ * default `core.quotepath=true` a path with any non-ASCII byte comes back
+ * C-quoted (`"\346\227\245..."`), which then (a) fails as a pathspec when it is
+ * fed back to `git diff -- <path>`, (b) fails as `git show <ref>:<path>`, and
+ * (c) can never compare equal to a path read from a `-z` producer such as
+ * pipeline/git.ts's `treeDiffPaths` — the incremental scope would silently
+ * classify the file as unchanged. Paths containing `"`, `\`, or a control
+ * character (a newline included) stay C-quoted even here, which is what keeps
+ * one-path-per-line splitting safe; every producer in this repo therefore uses
+ * this same flag so all of them agree byte-for-byte.
+ */
+const QUOTEPATH_OFF = ["-c", "core.quotepath=false"];
+
 /** Run `git` and return stdout, or null when git exits non-zero (the `|| true` idiom). */
 function gitOrNull(args: string[], cwd: string): string | null {
   try {
-    return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+    return execFileSync("git", [...QUOTEPATH_OFF, ...args], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 1024,
+    });
   } catch {
     return null;
   }
@@ -174,11 +194,48 @@ function resolveMergeBase(
   return mergeBase;
 }
 
+/** One parsed `git diff --numstat` row: added/removed counts (or "-"/"-" for binary) + path. */
+interface NumstatRow {
+  added: string;
+  removed: string;
+  path: string;
+}
+
+/**
+ * Parse `git diff --numstat` output into rows, in encounter order. Columns are
+ * added\tremoved\tpath; split on the first two tabs only, so a rename arrow
+ * carrying a tab leaves the path remainder intact.
+ */
+function parseNumstat(numstat: string): NumstatRow[] {
+  const rows: NumstatRow[] = [];
+  for (const row of numstat.split("\n")) {
+    if (row === "") continue;
+    const firstTab = row.indexOf("\t");
+    if (firstTab === -1) continue;
+    const rest = row.slice(firstTab + 1);
+    const secondTab = rest.indexOf("\t");
+    if (secondTab === -1) continue;
+    const added = row.slice(0, firstTab);
+    const removed = rest.slice(0, secondTab);
+    const path = unquoteGitPath(rest.slice(secondTab + 1));
+    if (path === "") continue;
+    rows.push({ added, removed, path });
+  }
+  return rows;
+}
+
 /**
  * Classify each changed file from `git diff --numstat`: binary files show the
  * sentinel "-\t-\t<path>"; non-binary files run through noiseReason() and are
  * either dropped (with a reason) or kept as text files. Returns the three
  * buckets in numstat (encounter) order, matching the bash while-loop.
+ *
+ * Blob reads for noiseReason's content rules are batched: one pre-pass collects
+ * every candidate path (non-binary, not already dropped by EXCLUDE_GLOBS or
+ * .gitattributes) and reads all of them via `batchRead` — one `cat-file
+ * --batch-check` spawn for sizes, one `cat-file --batch` spawn (bounded to
+ * MAX_BLOB_READ_BYTES per blob) for content — instead of a `git show`/
+ * `cat-file -s` PER FILE.
  */
 function classifyFiles(
   numstat: string,
@@ -192,32 +249,27 @@ function classifyFiles(
   const binary: string[] = [];
   const text: string[] = [];
   const dropped: DroppedFile[] = [];
+  const rows = parseNumstat(numstat);
 
   // A deleted path has no blob at the review head — `git show HEAD:<path>` dies
   // with `fatal: path … does not exist in 'HEAD'` (once per deleted file, straight
   // into the job log). Read deleted paths from the merge-base, where they DO exist.
   const refFor = (path: string): string => (deletedPaths.has(path) ? mergeBase : reviewHead);
-  const readBlob = (path: string): string | null =>
-    gitOrNull(["show", `${refFor(path)}:${path}`], cwd);
-  const blobSize = (path: string): number => {
-    const out = gitOrNull(["cat-file", "-s", `${refFor(path)}:${path}`], cwd);
-    return out === null ? 0 : Number.parseInt(out.trim(), 10) || 0;
-  };
 
-  for (const row of numstat.split("\n")) {
-    if (row === "") continue;
-    // numstat columns: added\tremoved\tpath. Split on the first two tabs only,
-    // so a rename arrow carrying a tab leaves the path remainder intact.
-    const firstTab = row.indexOf("\t");
-    if (firstTab === -1) continue;
-    const rest = row.slice(firstTab + 1);
-    const secondTab = rest.indexOf("\t");
-    if (secondTab === -1) continue;
-    const added = row.slice(0, firstTab);
-    const removed = rest.slice(0, secondTab);
-    const path = rest.slice(secondTab + 1);
-    if (path === "") continue;
+  const specs: BlobSpec[] = [];
+  for (const { added, removed, path } of rows) {
+    if (added === "-" && removed === "-") continue; // binary — never blob-read
+    if (excludeGlobs.length > 0 && anyGlobMatches(excludeGlobs, path)) continue;
+    if (generatedPaths.has(path)) continue;
+    specs.push({ ref: refFor(path), path });
+  }
+  // Size cutoff applied BEFORE content is fetched: a blob over LARGE_FILE_BYTES
+  // classifies "large-file" on size alone, so its content is never read.
+  const blobs = batchRead(specs, cwd, { sizeCutoff: LARGE_FILE_BYTES });
+  const readBlob = (path: string): string | null => blobs.get(path)?.content ?? null;
+  const blobSize = (path: string): number => blobs.get(path)?.size ?? 0;
 
+  for (const { added, removed, path } of rows) {
     if (added === "-" && removed === "-") {
       binary.push(path);
       continue;
@@ -305,7 +357,10 @@ export function fetchDiff(opts: DiffOptions): DiffData {
   // REVIEW diff below runs WITH -M so a move renders as a rename, not delete+add.
   const changedFiles =
     gitOrNull(["diff", "--no-renames", "--name-only", mergeBase, reviewHead], cwd) ?? "";
-  const changedPaths = changedFiles.split("\n").filter((l) => l.trim() !== "");
+  const changedPaths = changedFiles
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .map(unquoteGitPath);
   const totalFiles = changedPaths.length;
 
   if (totalFiles === 0) {
@@ -425,7 +480,7 @@ function deletedInRange(mergeBase: string, reviewHead: string, cwd: string): Set
     if (!line.startsWith("D")) continue;
     const tab = line.indexOf("\t");
     if (tab === -1) continue;
-    const path = line.slice(tab + 1);
+    const path = unquoteGitPath(line.slice(tab + 1));
     if (path !== "") out.add(path);
   }
   return out;
@@ -450,7 +505,9 @@ function detectRenames(
     if (parts.length < 3) continue;
     const from = parts[1];
     const to = parts[2];
-    if (from !== undefined && to !== undefined && kept.has(to)) out.push({ from, to });
+    if (from === undefined || to === undefined) continue;
+    const rename = { from: unquoteGitPath(from), to: unquoteGitPath(to) };
+    if (kept.has(rename.to)) out.push(rename);
   }
   return out;
 }

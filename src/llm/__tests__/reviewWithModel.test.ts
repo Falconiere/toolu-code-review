@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { reviewWithModel } from "@/llm/reviewWithModel.js";
 import type { Envelope } from "@/prompt.js";
+import { changes, modelServer } from "@/__tests__/integration/model.js";
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -57,6 +58,8 @@ describe("reviewWithModel", () => {
     expect(typeof result.error).toBe("string");
     expect(result.error).toBeTruthy();
     expect(result.finishReason).toBe("length");
+    // NoObjectGeneratedError (unparsable/empty content) is a "schema" failure — bisectable.
+    expect(result.failure).toBe("schema");
   });
 
   it("abstains on the FIRST attempt for empty content (reasoning-budget bug), not after escalating", async () => {
@@ -86,6 +89,7 @@ describe("reviewWithModel", () => {
     expect(result.finishReason).toBe("length");
     // The headline fix: empty content does NOT trigger the 3x budget-escalation retries.
     expect(calls).toBe(1);
+    expect(result.failure).toBe("schema");
   });
 
   it("salvages the findings completed before a length-truncation cut (partial)", async () => {
@@ -131,6 +135,7 @@ describe("reviewWithModel", () => {
     expect(result.findings).toEqual([]);
     expect(result.partial).toBeUndefined();
     expect(result.finishReason).toBe("length");
+    expect(result.failure).toBe("schema");
   });
 
   it("recovers a complete response whose values deviate from the strict schema", async () => {
@@ -260,6 +265,7 @@ describe("reviewWithModel", () => {
     expect(result.verdict).toBe("error");
     expect(result.findings).toEqual([]);
     expect(result.partial).toBeUndefined();
+    expect(result.failure).toBe("schema");
   });
 
   it("abstains rather than reporting a clean review when every finding is dropped", async () => {
@@ -279,6 +285,7 @@ describe("reviewWithModel", () => {
 
     expect(result.verdict).toBe("error");
     expect(result.findings).toEqual([]);
+    expect(result.failure).toBe("schema");
   });
 
   it("abstains without escalating when thinking burned the budget (empty content, length)", async () => {
@@ -311,6 +318,7 @@ describe("reviewWithModel", () => {
     expect(result.finishReason).toBe("length");
     // No output to grow into: one call, no budget-escalation retries.
     expect(calls).toBe(1);
+    expect(result.failure).toBe("schema");
   });
 
   it("aborts every hung attempt and abstains after exhausting the ceiling (verdict error, no hang)", async () => {
@@ -352,6 +360,8 @@ describe("reviewWithModel", () => {
     expect(calls).toBe(2);
     // It returned promptly via the per-attempt deadlines — nowhere near a hang.
     expect(elapsed).toBeLessThan(5_000);
+    // Every attempt was OUR per-attempt deadline firing, not a schema problem: "timeout".
+    expect(result.failure).toBe("timeout");
   });
 
   it("retries a hung attempt and succeeds on the next", async () => {
@@ -404,6 +414,9 @@ describe("reviewWithModel", () => {
   });
 
   it("abstains on a non-JSON / error HTTP response instead of throwing", async () => {
+    // A real gateway 5xx: plain-text body, not JSON — the shape the AI SDK reports as
+    // an APICallError (statusCode 500), never NoObjectGeneratedError, so this is a
+    // "transport" failure, not "schema".
     const errorFetch: typeof fetch = async () =>
       new Response("upstream exploded", {
         status: 500,
@@ -420,5 +433,80 @@ describe("reviewWithModel", () => {
     expect(result.verdict).toBe("error");
     expect(result.findings).toEqual([]);
     expect(result.error).toBeTruthy();
+    expect(result.failure).toBe("transport");
   });
+
+  it("abstains with a transport failure on a network-level fetch failure (no HTTP response at all)", async () => {
+    // The other transport shape: fetch itself rejects (DNS/connection failure), so there
+    // is no HTTP response to wrap — real fetch throws a plain TypeError("fetch failed")
+    // in this case, which is neither NoObjectGeneratedError nor an abort.
+    const networkFailureFetch: typeof fetch = async () => {
+      throw new TypeError("fetch failed");
+    };
+
+    const result = await reviewWithModel(ENVELOPE, {
+      model: "deepseek/deepseek-v4-flash",
+      apiKey: "sk-test",
+      fetch: networkFailureFetch,
+      maxRetries: 0,
+    });
+
+    expect(result.verdict).toBe("error");
+    expect(result.findings).toEqual([]);
+    expect(result.error).toBeTruthy();
+    expect(result.failure).toBe("transport");
+  });
+});
+
+// The third failure class had no test anywhere, because nothing could PRODUCE it:
+// `timeout` is classified off reviewWithModel's own per-attempt AbortController
+// firing, so no scripted HTTP status reaches it. The integration harness's
+// `fail: "timeout"` reply (src/__tests__/integration/model.ts) is a request that
+// never answers, which is the real shape — and these tests are what prove the
+// harness genuinely produces the classification the review layers branch on.
+describe("reviewWithModel — the `timeout` failure class", () => {
+  it("abstains with failure `timeout` when every attempt is aborted by its own deadline", async () => {
+    const server = modelServer({ reply: () => ({ fail: "timeout" }) });
+
+    const result = await reviewWithModel(ENVELOPE, {
+      model: "deepseek/deepseek-v4-flash",
+      apiKey: "sk-test",
+      fetch: server.fetch,
+      maxRetries: 0,
+      timeoutMs: 50, // the per-attempt deadline; each attempt hangs past it
+      maxAttempts: 2,
+    });
+
+    expect(result.verdict).toBe("error");
+    expect(result.findings).toEqual([]);
+    // NOT "schema" (nothing unparseable came back) and NOT "transport" (no HTTP
+    // failure happened) — review/bisect.ts branches on exactly this distinction:
+    // a timeout is never bisected, because splitting it would only multiply load.
+    expect(result.failure).toBe("timeout");
+    expect(result.error).toBeTruthy();
+    // Every attempt really was dispatched and really did hang.
+    expect(server.calls).toHaveLength(2);
+  }, 20_000);
+
+  it("recovers on a later attempt when only the FIRST call hangs", async () => {
+    // The hang is per-call, so the harness can script a stall followed by a real
+    // answer — proving the retry loop is what the classification above outlived,
+    // not a permanently broken seam.
+    const server = modelServer({
+      reply: (_call, index) => (index === 0 ? { fail: "timeout" } : changes([])),
+    });
+
+    const result = await reviewWithModel(ENVELOPE, {
+      model: "deepseek/deepseek-v4-flash",
+      apiKey: "sk-test",
+      fetch: server.fetch,
+      maxRetries: 0,
+      timeoutMs: 50,
+      maxAttempts: 2,
+    });
+
+    expect(result.verdict).toBe("changes");
+    expect(result.failure).toBeUndefined();
+    expect(server.calls).toHaveLength(2);
+  }, 20_000);
 });

@@ -64,8 +64,24 @@ describe("parseArgs", () => {
     expect(args.out).toBe("/tmp/out.json");
   });
 
-  it("rejects an unsupported --provider", () => {
+  it("rejects an unsupported --provider, naming every supported id", () => {
     expect(() => parseArgs(["--provider", "anthropic"])).toThrow(ArgError);
+    expect(() => parseArgs(["--provider", "anthropic"])).toThrow(
+      /\(openrouter, deepseek, minimax, kimi\)/,
+    );
+  });
+
+  it("resolves the native vendor providers and the moonshot alias to their defaults", () => {
+    const minimax = parseArgs(["--provider", "minimax"]);
+    expect(minimax.provider).toBe("minimax");
+    expect(minimax.model).toBe("MiniMax-M3");
+    // "moonshot" is Kimi's vendor and the spelling the action advertised first; the
+    // alias path is case-insensitive like the canonical ids.
+    for (const spelling of ["moonshot", "Moonshot"]) {
+      const moonshot = parseArgs(["--provider", spelling]);
+      expect(moonshot.provider).toBe("kimi");
+      expect(moonshot.model).toBe("kimi-k2.7-code");
+    }
   });
 
   it("rejects a malformed --pr", () => {

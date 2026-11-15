@@ -17,6 +17,7 @@ import type { ReviewState } from "@/state.js";
 import { upsertComment } from "@/github/comment.js";
 import { postInlineReview } from "@/github/review.js";
 import { setVerdictLabel } from "@/github/label.js";
+import { resolveLabelVerdict } from "@/review/gate.js";
 import {
   ACCEPTED_RESOLUTION_NOTE,
   hasAcceptedResolutionNote,
@@ -37,8 +38,10 @@ import { jobUrl, formatDuration } from "./bodies.js";
 import {
   decorateExemplars,
   expandApplied,
+  expandForSeverityGate,
   expandRepresentatives,
   reduceFindings,
+  spansFiles,
   undecorate,
   withCarriedWithoutFinding,
 } from "./reduce.js";
@@ -70,6 +73,8 @@ export interface PublishInput {
    *  feeds `settleVerdict`'s `removed`, flipping an all-junk "changes" to
    *  "approved" instead of blocking on noise (AC-8). */
   selfNegating: number;
+  /** Settled candidates removed before their stale source quotes could affect coverage. */
+  settledBeforeValidation?: number;
   priorThreads: PriorThread[];
   prior: ReviewState | null;
   stickyId: number | undefined;
@@ -157,13 +162,31 @@ export async function publish(input: PublishInput): Promise<ReviewResult> {
     ledgerSummary: renderLedgerSummary(ledger),
     unanchored: inline.unanchored,
     dropped: inline.dropped,
-    clusters: reduction.clustered,
+    // `spansFiles`: the section is "Repeated findings … in N files", and one cluster
+    // can now hold two findings that share a fingerprint (same defect, two lines of
+    // one file) without repeating across any files — see pipeline/reduce.ts.
+    clusters: reduction.clustered.filter(
+      (c) => spansFiles(c.members) && findings.some((f) => f.fp === c.exemplar.fp),
+    ),
   });
 
   const commentUrl = await upsertComment(octokit, target, body, input.stickyId);
+  // The LABEL follows APPROVE_BELOW: a "changes" verdict whose only findings are
+  // strictly below the threshold still reads "changes" in the comment/outputs
+  // (`verdict` below, unchanged), but the label itself may read "approved" — see
+  // review/gate.ts's resolveLabelVerdict doc for why this stays a separate value.
+  // It is fed FULL cluster member lists, not representatives: severity is not part
+  // of the cluster key, so a `low` exemplar must not hide a `blocker` member and
+  // flip the label to merge-approved. This is what review/recompute.ts already did,
+  // so the review path and the merge-gate recompute now agree.
+  const labelVerdict = resolveLabelVerdict({
+    verdict,
+    findings: expandForSeverityGate(findings, reduction),
+    approveBelow: inputs.approveBelow,
+  });
   // setVerdictLabel never throws — every labels-API call is caught inside
   // github/label.ts and reported via its LabelResult, so no try/catch here.
-  await setVerdictLabel(octokit, verdict, target, { manageLabels: inputs.manageLabels });
+  await setVerdictLabel(octokit, labelVerdict, target, { manageLabels: inputs.manageLabels });
   // AFTER postInline — ordering is load-bearing, see report/report-run.ts's doc.
   // Both sides of the partition carry expanded member lists (report/expand.ts).
   // reportRun() wraps its whole body in try/catch and is documented to never

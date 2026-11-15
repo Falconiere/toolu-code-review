@@ -5,6 +5,9 @@
 // is a drift from the deployed bash contract.
 import { z } from "zod";
 
+/** The five-level finding severity scale, highest first. */
+export type Severity = "blocker" | "high" | "medium" | "low" | "nit";
+
 /**
  * A single review finding. `path`, `line`, `severity`, `text` are required
  * (matching build-request.sh's FINDING_ITEM.required); everything else is
@@ -34,6 +37,18 @@ export const Finding = z.object({
   // (gitleaks/opengrep) finding it was asked to triage.
   source: z.enum(["llm", "gitleaks", "opengrep", "eslint"]).optional(),
   text: z.string(),
+  // Written LAST, after `text`: models reason inside `text` and often reach "no
+  // defect" only at its end (comemory PR #307: "… is safe. No defect, abstain."),
+  // after they have already committed to emitting the finding. This is the explicit
+  // way to withdraw it; review/validate.ts drops `no_defect`. Absent = `defect`, so
+  // recorded responses and custom prompts stay compatible.
+  conclusion: z
+    .enum(["defect", "no_defect"])
+    .optional()
+    .describe(
+      'Write LAST, after text. "no_defect" when your text concluded nothing is ' +
+        "wrong; the finding is then discarded.",
+    ),
 });
 
 /**
@@ -133,7 +148,7 @@ const VERDICT_ALIASES: Record<string, "approved" | "changes"> = {
  * UNAMBIGUOUSLY onto the five-level scale are listed — an unrecognized severity cannot
  * be ranked or gated on, so recovery drops that finding rather than inventing a level.
  */
-const SEVERITY_ALIASES: Record<string, "blocker" | "high" | "medium" | "low" | "nit"> = {
+export const SEVERITY_ALIASES: Record<string, Severity> = {
   blocker: "blocker",
   blocking: "blocker",
   critical: "blocker",
@@ -216,6 +231,7 @@ export function normalizeFinding(raw: unknown): unknown {
   if (source !== "llm" && source !== "gitleaks" && source !== "opengrep" && source !== "eslint") {
     delete out["source"];
   }
+  if (out["conclusion"] !== "defect" && out["conclusion"] !== "no_defect") delete out["conclusion"];
   return out;
 }
 

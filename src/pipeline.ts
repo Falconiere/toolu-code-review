@@ -31,6 +31,7 @@ import type { PriorSticky } from "./pipeline/sticky.js";
 import type { IncrementalScope } from "./review/incremental.js";
 import { reviewAndValidate } from "./pipeline/reviewCall.js";
 import { publish } from "./pipeline/publish.js";
+import { runDismissRecompute } from "./pipeline/dismissRecompute.js";
 import { skipBody, noopBody } from "./pipeline/bodies.js";
 import type { GithubContext, PipelineOctokit, ReviewDeps, ReviewResult } from "./pipeline/types.js";
 
@@ -52,8 +53,8 @@ export async function runReview(deps: ReviewDeps): Promise<ReviewResult> {
   const cwd = deps.cwd ?? process.cwd();
   const now = deps.now ?? Date.now;
   const startMs = now();
-  // MAX_WALL_MS soft budget: undefined (off) when unset, else an epoch-ms deadline
-  // the review loop checks against (review/bisect.ts's `deadlinePassed`) — computed
+  // MAX_WALL_MS shared model deadline: undefined when explicitly disabled, else
+  // checked before dispatch and used to abort active model attempts — computed
   // once, off the same start timestamp `publish()` uses for the run's duration.
   const wallDeadline = inputs.maxWallMs > 0 ? startMs + inputs.maxWallMs : undefined;
 
@@ -61,6 +62,8 @@ export async function runReview(deps: ReviewDeps): Promise<ReviewResult> {
   if (!event || event.pr_number === undefined) {
     return { verdict: "skip", findingsCount: 0, commentUrl: "" };
   }
+  // A thread reply settles, it never reviews: no git, no model (pipeline/dismissRecompute.ts).
+  if (event.settle === true) return runDismissRecompute(deps, event.pr_number);
   const target: RunTarget = {
     owner: context.repo.owner,
     repo: context.repo.repo,
@@ -101,8 +104,6 @@ export async function runReview(deps: ReviewDeps): Promise<ReviewResult> {
   // FETCH_HEAD` — the fetched PR head itself, the correct series anchor.
   const reviewedSha = event.head_sha ?? target.headSha;
 
-  const scope = incrementalScope(deps, found, reviewHead, cwd);
-
   // TREE scope (spec §True incremental): which FILES this round re-reviews. Null =
   // full diff (fail-open). Everything it drops is carried — not re-reviewed, prior
   // findings re-injected in publish so no thread is falsely resolved.
@@ -112,6 +113,8 @@ export async function runReview(deps: ReviewDeps): Promise<ReviewResult> {
     reviewHead,
     cwd,
   });
+  // Tree scope may recover the previously reviewed commit from origin.
+  const scope = incrementalScope(deps, found, reviewHead, cwd);
   const scoped =
     treeScope === null ? { diff, carried: [] } : filterDiffToScope(diff, treeScope.inScope);
   if (scoped.carried.length > 0) {
@@ -128,6 +131,7 @@ export async function runReview(deps: ReviewDeps): Promise<ReviewResult> {
     priorThreads,
     reviewHead,
     cwd,
+    priorClusters: found.prior?.clusters,
     sarifDir: deps.sarifDir,
     fetch: deps.fetch,
     carriedPaths: scoped.carried,
@@ -149,6 +153,7 @@ export async function runReview(deps: ReviewDeps): Promise<ReviewResult> {
     result: reviewed.result,
     stamped: reviewed.stamped,
     selfNegating: reviewed.selfNegating,
+    settledBeforeValidation: reviewed.settledBeforeValidation,
     mechanical: reviewed.mechanical,
     ledger: reviewed.ledger,
     exceptionPaths: treeScope?.exceptions ?? new Set<string>(),

@@ -26,6 +26,54 @@ function lastLine(body: string): string {
 }
 
 describe("formatVerdict", () => {
+  it("distinguishes local evidence failures from provider failures", () => {
+    const { body } = formatVerdict(
+      {
+        verdict: "error",
+        findings: [],
+        partial: true,
+        review_plan: "Reviewed the code.",
+        error: "Review findings lacked valid source evidence.",
+        failure: "evidence",
+      },
+      {},
+    );
+    expect(body).toContain("Review incomplete — source evidence");
+    expect(body).not.toContain("provider error");
+  });
+  it("labels a missing-quote evidence failure as the gate's, not the provider's", () => {
+    // The model answered (finish_reason "stop") with no review plan; the gate rejected
+    // its unquoted findings. Before toolu-ghrunner PR #210 this rendered "Provider
+    // error … [finish_reason: stop]" over "LLM judgment unavailable".
+    const { body, label } = formatVerdict(
+      {
+        verdict: "error",
+        findings: [],
+        partial: true,
+        finishReason: "stop",
+        error: "Review findings lacked valid source evidence; affected files remain unreviewed.",
+        failure: "evidence",
+      },
+      {},
+    );
+    expect(body).toContain("Review incomplete — source evidence");
+    expect(body).toContain("**Partial review:** Review findings lacked valid source evidence");
+    expect(body).not.toContain("Provider error");
+    expect(body).not.toContain("finish_reason");
+    expect(body).not.toContain("LLM judgment unavailable");
+    expect(label).toBe("request-changes");
+  });
+  it("notes unverifiable dropped findings without blocking an approval", () => {
+    const { body, label } = formatVerdict(
+      { verdict: "approved", findings: [], unverifiedEvidence: 2 },
+      {},
+    );
+    expect(body).toContain(
+      "> ℹ️ **Unverified findings:** 2 finding(s) dropped: the quoted source was not found " +
+        "at the cited line, so the claim could not be verified.",
+    );
+    expect(label).toBe("merge-approved");
+  });
   it("maps approved → merge-approved label and ✅ badge", () => {
     const result: ProviderResult = {
       verdict: "approved",
@@ -73,9 +121,9 @@ describe("formatVerdict", () => {
     expect(lastLine(body)).toBe(MARKER);
   });
 
-  it("dedupes top_must_fix and caps it at 3 (FIX 11 — coordinate-findings parity)", () => {
-    // 10 items with duplicates: the rendered Top-N must-fix section keeps the first
-    // 3 UNIQUE items in order, matching the bash `unique | .[0:3]` cap.
+  it("does not render model top_must_fix prose when no validated findings survive", () => {
+    // The recorded model summary is untrusted independently generated prose. It
+    // must never resurrect a claim that validation already rejected.
     const topMustFix = [
       "Fix the auth bypass in login.ts",
       "Fix the auth bypass in login.ts", // dup of #1
@@ -97,18 +145,8 @@ describe("formatVerdict", () => {
     };
     const { body } = formatVerdict(result, {});
 
-    // Exactly the 3 first-seen unique items render; the 4th+ unique ones do not.
-    expect(body).toContain("Fix the auth bypass in login.ts");
-    expect(body).toContain("Close the SQL injection in query.ts");
-    expect(body).toContain("Handle the null deref in parse.ts");
-    expect(body).not.toContain("A fifth distinct must-fix");
-    expect(body).not.toContain("A sixth distinct must-fix");
-
-    // The Top-N section body has exactly 3 lines (no duplicate of #1).
-    const section = body.split("### Top-N must-fix\n")[1] ?? "";
-    const firstItem = "Fix the auth bypass in login.ts";
-    const occurrences = section.split(firstItem).length - 1;
-    expect(occurrences).toBe(1);
+    expect(body).not.toContain("### Top-N must-fix");
+    expect(body).not.toContain("Fix the auth bypass in login.ts");
   });
 
   it("enforces the 65000-char cap, dropping lowest-severity findings first while recap + marker survive", () => {
@@ -144,11 +182,12 @@ describe("formatVerdict", () => {
     expect(body).toContain(MARKER);
     expect(lastLine(body)).toBe(MARKER);
     // Lowest-severity dropped first: blockers/highs kept, the overflow note present.
-    expect(body).toContain("blocker:");
+    expect(body).toContain("#### 🔴 Blocker · ");
     expect(body).toMatch(/_… \d+ more findings/);
-    // The truncated section is ordered worst-first, so a blocker line precedes any nit.
-    const blockerIdx = body.indexOf(": blocker:");
-    const nitIdx = body.indexOf(": nit:");
+    // The truncated section is ordered worst-first, so the blocker group heading
+    // precedes any nit group heading.
+    const blockerIdx = body.indexOf("#### 🔴 Blocker");
+    const nitIdx = body.indexOf("#### ⚪ Nit");
     if (nitIdx !== -1) expect(blockerIdx).toBeLessThan(nitIdx);
   });
 });
@@ -190,7 +229,7 @@ describe("formatVerdict — verbosity (compact vs full) + dedup", () => {
     expect(body).not.toContain("Reviewed 3-file diff");
   });
 
-  it("omits empty Review Plan / Other checks / Top-N sections (no filler)", () => {
+  it("omits empty plan/check sections but renders Top-N for a surviving finding", () => {
     const bare: ProviderResult = {
       verdict: "changes",
       findings: [{ path: "src/a.ts", line: 1, severity: "high", text: "bug", confidence: "high" }],
@@ -203,14 +242,14 @@ describe("formatVerdict — verbosity (compact vs full) + dedup", () => {
     expect(body).not.toContain("_No review plan provided._");
     expect(body).not.toContain("### Other checks");
     expect(body).not.toContain("_No additional checks performed._");
-    // Top-N is no longer auto-generated from findings.
-    expect(body).not.toContain("### Top-N must-fix");
+    expect(body).toContain("### Top-N must-fix");
   });
 
-  it("never auto-duplicates findings into Top-N: each finding text appears exactly once", () => {
+  it("derives Top-N from surviving findings instead of model prose", () => {
     const { body } = formatVerdict(base, {});
-    expect(body.split("auth bypass").length - 1).toBe(1);
-    expect(body.split("spacing").length - 1).toBe(1);
+    expect(body).toContain("### Top-N must-fix");
+    expect(body).toContain("`src/a.ts:10` — auth bypass");
+    expect(body).toContain("`src/b.ts:4` — spacing");
   });
 
   it("severity-sorts the Findings list worst-first without mutating the input array", () => {
@@ -223,18 +262,19 @@ describe("formatVerdict — verbosity (compact vs full) + dedup", () => {
     // Blocker renders before the nit even though it was second in the input. Assert
     // on the extracted finding-line path sequence, not indexOf over the whole body,
     // so surrounding text (severity summary, headings) can't mask a bad sort.
-    const orderedPaths = [...body.matchAll(/^`(src\/[^`:]+):\d+`/gm)].map((m) => m[1]);
+    const orderedPaths = [...body.matchAll(/^\*\*\d+\.\*\* `(src\/[^`]+)`/gm)].map((m) => m[1]);
     expect(orderedPaths).toEqual(["src/blk.ts", "src/nit.ts"]);
     // The caller's array is untouched (reconcile/inline posting reuse it downstream).
     expect(findings).toEqual(snapshot);
   });
 
-  it("renders the model's explicit Top-N list in BOTH modes", () => {
+  it("ignores model Top-N prose in BOTH modes", () => {
     const withTop: ProviderResult = { ...base, top_must_fix: ["Fix the auth bypass now"] };
     for (const verbosity of ["compact", "full"] as const) {
       const { body } = formatVerdict(withTop, { verbosity, changedFiles: 2 });
       expect(body).toContain("### Top-N must-fix");
-      expect(body).toContain("Fix the auth bypass now");
+      expect(body).not.toContain("Fix the auth bypass now");
+      expect(body).toContain("`src/a.ts:10` — auth bypass");
     }
   });
 });
@@ -262,7 +302,7 @@ describe("formatVerdict — mechanical findings + graceful degradation", () => {
     const { body } = formatVerdict(result, { mechanical: [secret] });
     expect(body).toContain("### Mechanical checks");
     expect(body).toContain("1 gitleaks");
-    expect(body).toContain("_[gitleaks]_"); // provenance tag on the finding line
+    expect(body).toContain("**[gitleaks]**"); // provenance tag on the finding's meta line
   });
 
   it("on LLM error WITH mechanical findings, degrades gracefully (section + 'LLM judgment unavailable')", () => {
@@ -327,6 +367,43 @@ describe("formatVerdict — mechanical findings + graceful degradation", () => {
     expect(body).toContain("**Partial review:**");
     expect(body).toContain("1/3 chunks truncated");
     expect(label).toBe("request-changes");
+  });
+
+  it("an evidence-gated review is NOT 'LLM judgment unavailable' (PR #109 regression)", () => {
+    // Replays the real failure: the provider answered in full — review plan AND
+    // other-checks blurb — but every finding was dropped by the source-evidence gate,
+    // so reviewCall.ts forced verdict "error". The comment then rendered "LLM judgment
+    // unavailable — no deterministic findings either." directly above the model's own
+    // review plan and other-checks prose, contradicting its own body.
+    const result: ProviderResult = {
+      verdict: "error",
+      findings: [],
+      review_plan: "Reviewing 37 files: 8 correctness-critical, 6 test-coverage additions.",
+      other_checks: "The wallLimited guard misattributes per-attempt timeouts as wall expiries.",
+      top_must_fix: [],
+      partial: true,
+      error: "Review findings lacked valid source evidence; affected files remain unreviewed.",
+    };
+    const { body, label } = formatVerdict(result, {});
+    expect(body).not.toContain("LLM judgment unavailable");
+    // The gate failure is still surfaced, and the review still fails safe.
+    expect(body).toContain("affected files remain unreviewed");
+    expect(label).toBe("request-changes");
+  });
+
+  it("an evidence-gated review WITH mechanical findings keeps the counts, no 'unavailable' note", () => {
+    const result: ProviderResult = {
+      verdict: "error",
+      findings: [],
+      review_plan: "Reviewing 37 files.",
+      other_checks: "",
+      top_must_fix: [],
+      error: "Review findings lacked valid source evidence; affected files remain unreviewed.",
+    };
+    const { body } = formatVerdict(result, { mechanical: [secret] });
+    expect(body).toContain("### Mechanical checks");
+    expect(body).toContain("1 gitleaks");
+    expect(body).not.toContain("LLM judgment unavailable");
   });
 });
 

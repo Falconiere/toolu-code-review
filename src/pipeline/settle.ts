@@ -10,13 +10,14 @@
 // what makes the marker resumable (`complete`, the exception lists, `reviewed_tree`).
 import { renderRecapSection, renderHistorySection } from "@/review/recap.js";
 import { resolveVerdict } from "@/review/verdict.js";
-import { diffState, encodeMarker } from "@/state.js";
+import { completedRounds, diffState, encodeMarker } from "@/state.js";
 import { dropSettled } from "@/review/reconcile.js";
 import { dropOutOfScope } from "@/review/incremental.js";
 import { applyRoundCap } from "@/review/gate.js";
 import { pathsWithStatus, type CoverageLedger } from "@/review/ledger.js";
 import type { ProviderResult } from "@/llm/reviewWithModel.js";
 import type { PublishInput } from "./publish.js";
+import { expandForSeverityGate } from "./reduce.js";
 import type { Reduction } from "./reduce.js";
 import type { StampedFinding } from "./reviewCall.js";
 
@@ -55,8 +56,10 @@ export interface SettledVerdict {
  * review — new findings only from lines changed since the last reviewed sha, with
  * the resume exception paths always in scope), respect settled threads at CLUSTER
  * level — resolved on GitHub or dismissed in a reply, where dismissing the exemplar
- * dismisses the pattern — flip a now-findingless "changes" to "approved", then apply
- * the (optional) MAX_ROUNDS surrender cap and the ledger's own degrade rule.
+ * dismisses the pattern. A now-findingless "changes" becomes "approved" when all
+ * findings were accounted for as removed, or "error" when the model supplied no
+ * supporting finding. Then apply the (optional) MAX_ROUNDS surrender cap and the
+ * ledger's own degrade rule.
  */
 export function settleVerdict(
   input: PublishInput,
@@ -87,6 +90,9 @@ export function settleVerdict(
     );
   }
   const validated: ProviderResult = { ...input.result, findings };
+  // Free-form model commentary cannot be reconciled with individual findings.
+  // Never let it reintroduce rejected/dismissed claims outside the finding list.
+  validated.other_checks = "";
   // `verdict` is the ONLY thing the rules below move; `validated.verdict` is written
   // from it once, just before the return. Deliberately not paired per rule: a rule
   // that updates one half and forgets the other is how the returned verdict and the
@@ -94,16 +100,29 @@ export function settleVerdict(
   let verdict = resolveVerdict(validated.verdict, findings.length);
   // `removed` — every finding this round accounted for but did not carry forward
   // to the comment: settled on its thread (suppressed), out of the incremental
-  // scope (scoped.dropped), or self-negating noise validateFindings already
-  // dropped before this function ever saw it (input.selfNegating — AC-8).
-  const removed = suppressed.length + scoped.dropped.length + input.selfNegating;
-  if (verdict === "changes" && findings.length === 0 && removed > 0) {
-    // Every concrete finding was either settled on its thread (resolved or
-    // dismissed by the author), out of the incremental scope, or dropped as
-    // self-negating chatter that never should have been a finding; keeping the
-    // model's request-changes would re-block on code that was already reviewed,
-    // decisions a human already made, or junk the model itself contradicted.
-    verdict = "approved";
+  // scope (scoped.dropped), or self-negating noise or an unverifiable quote that
+  // validateFindings already dropped before this function ever saw it
+  // (input.selfNegating — AC-8; result.unverifiedEvidence).
+  const removed =
+    suppressed.length +
+    scoped.dropped.length +
+    input.selfNegating +
+    (input.result.unverifiedEvidence ?? 0) +
+    (input.settledBeforeValidation ?? 0) +
+    (input.result.enhancement?.dismissed ?? 0);
+  if (verdict === "changes" && findings.length === 0) {
+    if (removed > 0) {
+      // Every concrete finding was settled, out of scope, or self-negating.
+      verdict = "approved";
+    } else {
+      // A bare request for changes supplies nothing a reader can verify or fix.
+      // Keep the review distinct from both an actionable change request and an
+      // approval when the provider gives no supporting finding at all.
+      verdict = "error";
+      validated.failure ??= "schema";
+      validated.error ??=
+        "Model requested changes but supplied no source-validated actionable findings.";
+    }
   }
   // A CARRIED finding was not re-examined this round (its path was out of the tree
   // scope, collapsed, or unreviewable), so this round's approval speaks only for the
@@ -123,8 +142,15 @@ export function settleVerdict(
   // so a reviewer that generates fresh findings every push cannot block forever.
   const cap = applyRoundCap({
     verdict,
-    findings,
-    priorRounds: input.prior?.history?.length ?? 0,
+    // Members, not representatives: severity is not part of the cluster key, so an
+    // exemplar picked by lowest fingerprint can be `low` while one of its members
+    // is a `blocker` — and the blocker check below must SEE that blocker or the cap
+    // approves a PR a showstopper is still standing on. Same expansion
+    // review/recompute.ts does before its own label gate, so the two paths agree.
+    findings: expandForSeverityGate(findings, reduction),
+    // The monotonic counter, not `history.length`: history is display-capped to the
+    // last 10, so deriving the round from it made MAX_ROUNDS ≥ 12 unreachable.
+    priorRounds: completedRounds(input.prior),
     maxRounds: input.inputs.reviewMemory ? input.inputs.maxRounds : 0,
   });
   let capNote = "";
@@ -182,6 +208,7 @@ function degradeOnCoverage(
 ): ProviderResult["verdict"] {
   if (exceptions.complete || verdict !== "approved") return verdict;
   const count = exceptions.unreviewed.length + exceptions.pending.length;
+  validated.failure ??= "coverage";
   if (validated.error === undefined || validated.error === "") {
     validated.error =
       `${count} file(s) were not reviewed this run (see Coverage below) — an approval ` +
@@ -235,7 +262,13 @@ export function renderMemory(
     : "";
   return {
     recap,
-    history: renderHistorySection(state.next_state.history),
+    // `history` is capped at its last 10 entries, so number the rows from the true
+    // round counter instead of the array index — otherwise the Pass column silently
+    // restarts at 1 on round 11 (see recap.ts's `firstPass`).
+    history: renderHistorySection(
+      state.next_state.history,
+      completedRounds(state.next_state) - state.next_state.history.length + 1,
+    ),
     marker: encodeMarker(state.next_state),
   };
 }

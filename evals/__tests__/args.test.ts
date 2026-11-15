@@ -1,6 +1,5 @@
 // evals/__tests__/args.test.ts — pure argument-parsing tests (no gh/network/
-// key). Run directly with `bun test evals/__tests__` — NOT part of `bun run
-// check` (evals/ is outside every leg's project, see .oxlintrc.json + tsconfig).
+// key). Run with `bun run test:evals`, which `bun run check` and CI both invoke.
 import { describe, it, expect } from "bun:test";
 import { parseArgs, parsePrRef, usage, ArgError, DEFAULT_PR } from "../args.js";
 
@@ -47,9 +46,9 @@ describe("parseArgs", () => {
       "--pr",
       "acme/widgets#9",
       "--provider",
-      "deepseek",
+      "openrouter",
       "--model",
-      "deepseek-v4-flash",
+      "deepseek/deepseek-v4-flash",
       "--max-wall-ms",
       "12000",
       "--out",
@@ -58,30 +57,67 @@ describe("parseArgs", () => {
     expect(args.owner).toBe("acme");
     expect(args.repo).toBe("widgets");
     expect(args.prNumber).toBe(9);
-    expect(args.provider).toBe("deepseek");
-    expect(args.model).toBe("deepseek-v4-flash");
+    expect(args.provider).toBe("openrouter");
+    expect(args.model).toBe("deepseek/deepseek-v4-flash");
     expect(args.maxWallMs).toBe(12000);
     expect(args.out).toBe("/tmp/out.json");
   });
 
-  it("rejects an unsupported --provider, naming every supported id", () => {
+  it("rejects an unsupported --provider, naming the supported id and the workaround", () => {
     expect(() => parseArgs(["--provider", "anthropic"])).toThrow(ArgError);
     expect(() => parseArgs(["--provider", "anthropic"])).toThrow(
-      /\(openrouter, deepseek, minimax, kimi\)/,
+      /\(openrouter, openai-compatible\)/,
+    );
+    expect(() => parseArgs(["--provider", "anthropic"])).toThrow(/--model <id>/);
+    expect(() => parseArgs(["--provider", "anthropic"])).toThrow(
+      /https:\/\/openrouter\.ai\/models/,
     );
   });
 
-  it("resolves the native vendor providers and the moonshot alias to their defaults", () => {
-    const minimax = parseArgs(["--provider", "minimax"]);
-    expect(minimax.provider).toBe("minimax");
-    expect(minimax.model).toBe("MiniMax-M3");
-    // "moonshot" is Kimi's vendor and the spelling the action advertised first; the
-    // alias path is case-insensitive like the canonical ids.
-    for (const spelling of ["moonshot", "Moonshot"]) {
-      const moonshot = parseArgs(["--provider", spelling]);
-      expect(moonshot.provider).toBe("kimi");
-      expect(moonshot.model).toBe("kimi-k2.7-code");
+  it("rejects the REMOVED native vendor providers, pointing at the OpenRouter catalog", () => {
+    // The advice never composes an id from the --provider spelling: a vendor's OpenRouter
+    // namespace is not always its name (Kimi publishes under "moonshotai"), so
+    // "kimi/<model>" would be an id OpenRouter does not serve.
+    for (const removed of ["deepseek", "minimax", "kimi", "MoonShot"]) {
+      expect(() => parseArgs(["--provider", removed])).toThrow(ArgError);
+      expect(() => parseArgs(["--provider", removed])).toThrow(/https:\/\/openrouter\.ai\/models/);
+      expect(() => parseArgs(["--provider", removed])).not.toThrow(
+        new RegExp(`--model "${removed}/`),
+      );
     }
+  });
+
+  it("treats a BLANK flag value as missing, naming the starved flag", () => {
+    // `--model ""` used to resolve to an empty model id and only fail at the model call;
+    // whitespace-only slipped through the same way. --max-wall-ms reaches the same guard
+    // through requireInt, so its blank error is the flag-name one too.
+    for (const flag of ["--pr", "--provider", "--model", "--out", "--max-wall-ms"]) {
+      for (const blank of ["", "   "]) {
+        expect(() => parseArgs([flag, blank])).toThrow(new RegExp(`${flag} requires a value`));
+      }
+    }
+  });
+
+  it("trims a flag value, so a padded id never reaches the model call", () => {
+    expect(parseArgs(["--model", "  anthropic/claude-sonnet-4-5  "]).model).toBe(
+      "anthropic/claude-sonnet-4-5",
+    );
+    // The trim runs BEFORE parsePrRef, whose regex has no room for whitespace, so a
+    // padded --pr ref now parses instead of being rejected for its padding.
+    const padded = parseArgs(["--pr", "  acme/widgets#9  "]);
+    expect([padded.owner, padded.repo, padded.prNumber]).toEqual(["acme", "widgets", 9]);
+  });
+
+  it("reads a padded next flag as a missing value, not as this flag's value", () => {
+    // The next-flag guard runs on the TRIMMED value: " --pr" must not slip past it on a
+    // leading space and become the model id.
+    expect(() => parseArgs(["--model", " --pr"])).toThrow(/--model requires a value/);
+  });
+
+  it("resolves --provider case-insensitively and defaults --model to the action's own", () => {
+    const args = parseArgs(["--provider", "OpenRouter"]);
+    expect(args.provider).toBe("openrouter");
+    expect(args.model).toBe("deepseek/deepseek-v4-pro");
   });
 
   it("rejects a malformed --pr", () => {
@@ -109,7 +145,7 @@ describe("parseArgs", () => {
   });
 
   it("treats a value starting with '--' as a missing value, naming the starved flag", () => {
-    expect(() => parseArgs(["--pr", "--provider", "deepseek"])).toThrow(/--pr requires a value/);
+    expect(() => parseArgs(["--pr", "--provider", "openrouter"])).toThrow(/--pr requires a value/);
   });
 });
 
@@ -121,4 +157,65 @@ describe("usage", () => {
     }
     expect(text).toContain("API_KEY");
   });
+});
+
+it("paired Jev evaluation rejects native providers", () => {
+  expect(() => parseArgs(["--compare-jev", "--provider", "deepseek"])).toThrow(
+    /is not supported \(openrouter, openai-compatible\)/,
+  );
+});
+
+it("enables paired evaluation with pinned revision overrides", () => {
+  expect(parseArgs(["--compare-jev", "--head-sha", "abc", "--base-sha", "def"])).toMatchObject({
+    compareJev: true,
+    headSha: "abc",
+    baseSha: "def",
+  });
+});
+
+it("passes a custom endpoint through to the live evaluation inputs", () => {
+  expect(
+    parseArgs([
+      "--provider",
+      "openai-compatible",
+      "--base-url",
+      "http://127.0.0.1:8000/v1/",
+      "--model",
+      "qwen3:0.6b",
+      "--extra-body",
+      '{"chat_template_kwargs":{"enable_thinking":false}}',
+    ]),
+  ).toMatchObject({
+    provider: "openai-compatible",
+    baseUrl: "http://127.0.0.1:8000/v1",
+    model: "qwen3:0.6b",
+    extraBody: { chat_template_kwargs: { enable_thinking: false } },
+  });
+});
+
+it("rejects invalid custom options and custom options on OpenRouter", () => {
+  expect(() =>
+    parseArgs(["--extra-body", '{"chat_template_kwargs":{"enable_thinking":false}}']),
+  ).toThrow("--extra-body requires --provider openai-compatible");
+  expect(() => parseArgs(["--extra-body", "[]"])).toThrow("EXTRA_BODY must be a valid JSON object");
+});
+
+it("rejects incomplete custom configuration and Jev comparison with a custom endpoint", () => {
+  expect(() => parseArgs(["--provider", "openai-compatible"])).toThrow(
+    "requires --base-url and --model",
+  );
+  expect(() => parseArgs(["--base-url", "http://127.0.0.1:8000/v1"])).toThrow(
+    "requires --provider openai-compatible",
+  );
+  expect(() =>
+    parseArgs([
+      "--compare-jev",
+      "--provider",
+      "openai-compatible",
+      "--base-url",
+      "http://127.0.0.1:8000/v1",
+      "--model",
+      "qwen3:0.6b",
+    ]),
+  ).toThrow("--compare-jev requires openrouter");
 });

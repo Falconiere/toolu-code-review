@@ -4,7 +4,13 @@ import * as core from "@actions/core";
 // below needs this spy-mode mock: every export stays the real implementation, wrapped
 // in a spy that vi.spyOn can then redirect. Nothing about the logger is faked.
 vi.mock(import("@actions/core"), { spy: true });
-import { readInputs } from "@/inputs.js";
+import {
+  readInputs,
+  parseMinTriggerPermission,
+  parseTriggerPhrase,
+  DEFAULT_TRIGGER_PHRASE,
+} from "@/inputs.js";
+import { DEFAULT_MODEL } from "@/llm/providers.js";
 
 /** Set an action input as @actions/core reads it (process.env.INPUT_<NAME>). */
 function setInput(name: string, value: string): void {
@@ -71,8 +77,8 @@ describe("MAX_CHUNKS", () => {
 });
 
 describe("MAX_WALL_MS", () => {
-  it("defaults to 0 (off)", () => {
-    expect(readInputs().maxWallMs).toBe(0);
+  it("defaults to ten minutes", () => {
+    expect(readInputs().maxWallMs).toBe(600000);
   });
 
   it("parses a positive override", () => {
@@ -80,9 +86,29 @@ describe("MAX_WALL_MS", () => {
     expect(readInputs().maxWallMs).toBe(600000);
   });
 
-  it("falls back to 0 on a non-numeric value", () => {
+  it("falls back to ten minutes on a non-numeric value", () => {
     setInput("MAX_WALL_MS", "abc");
+    expect(readInputs().maxWallMs).toBe(600000);
+  });
+
+  it("allows an explicit zero to disable the budget", () => {
+    setInput("MAX_WALL_MS", "0");
     expect(readInputs().maxWallMs).toBe(0);
+  });
+
+  it("rejects a negative budget instead of silently disabling it", () => {
+    setInput("MAX_WALL_MS", "-1");
+    expect(() => readInputs()).toThrow("MAX_WALL_MS must be a non-negative integer");
+  });
+
+  it.each(["-0.5", "0.5", "1.5"])("rejects fractional budget %s", (value) => {
+    setInput("MAX_WALL_MS", value);
+    expect(() => readInputs()).toThrow("MAX_WALL_MS must be a non-negative integer");
+  });
+
+  it("does not interpret malformed zero text as an explicit opt-out", () => {
+    setInput("MAX_WALL_MS", "0ms");
+    expect(readInputs().maxWallMs).toBe(600000);
   });
 });
 
@@ -103,6 +129,22 @@ describe("FAIL_ON", () => {
     const failOn = readInputs().failOn;
     expect(failOn.has("changes")).toBe(true);
     expect(failOn.has("error")).toBe(true);
+  });
+});
+
+describe("APPROVE_BELOW", () => {
+  it("AC-6: defaults to 'nit' when unset, preserving 'any finding blocks'", () => {
+    expect(readInputs().approveBelow).toBe("nit");
+  });
+
+  it("AC-6: APPROVE_BELOW=high flows through to ActionInputs.approveBelow", () => {
+    setInput("APPROVE_BELOW", "high");
+    expect(readInputs().approveBelow).toBe("high");
+  });
+
+  it("AC-5: APPROVE_BELOW=critical normalizes via SEVERITY_ALIASES to 'blocker'", () => {
+    setInput("APPROVE_BELOW", "critical");
+    expect(readInputs().approveBelow).toBe("blocker");
   });
 });
 
@@ -170,6 +212,80 @@ describe("RULES_REF", () => {
   });
 });
 
+describe("MIN_TRIGGER_PERMISSION", () => {
+  it("defaults to write when unset, and stays silent about it", () => {
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
+    expect(readInputs().minTriggerPermission).toBe("write");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("honors an explicit admin, case-insensitively and trimmed", () => {
+    setInput("MIN_TRIGGER_PERMISSION", "  Admin  ");
+    expect(readInputs().minTriggerPermission).toBe("admin");
+  });
+
+  it("honors an explicit write without warning", () => {
+    setInput("MIN_TRIGGER_PERMISSION", "WRITE");
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
+    expect(readInputs().minTriggerPermission).toBe("write");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("falls back to write on an unrecognized value, WITH a warning", () => {
+    // It used to fall back SILENTLY, so a `maintain`/`triage`/`admin ` typo quietly
+    // loosened the gate to anyone with write access — and nothing in the run log said
+    // so. VERBOSITY and RULES_REF already warn on exactly this class of typo.
+    setInput("MIN_TRIGGER_PERMISSION", "maintain");
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
+    expect(readInputs().minTriggerPermission).toBe("write");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('is not "write" or "admin"'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("MIN_TRIGGER_PERMISSION"));
+  });
+});
+
+describe("TRIGGER_PHRASE", () => {
+  it("defaults to @toolu when unset", () => {
+    expect(readInputs().triggerPhrase).toBe(DEFAULT_TRIGGER_PHRASE);
+    expect(DEFAULT_TRIGGER_PHRASE).toBe("@toolu");
+  });
+
+  it("honors and trims an override", () => {
+    setInput("TRIGGER_PHRASE", "  @review-bot  ");
+    expect(readInputs().triggerPhrase).toBe("@review-bot");
+  });
+
+  it("falls back to the default on a whitespace-only value", () => {
+    setInput("TRIGGER_PHRASE", "   ");
+    expect(readInputs().triggerPhrase).toBe(DEFAULT_TRIGGER_PHRASE);
+  });
+});
+
+// gate/settleCheckCli.ts is a node-type action: it gets no argv, so it reads raw
+// `INPUT_*` strings off process.env and cannot go through readInputs(). It used to
+// hand-duplicate all three of these defaults, and nothing kept them in sync — if they
+// drifted, the merge-gate recompute and the review run would disagree about which
+// comment settles a finding. Both now call the same pure parsers.
+describe("the merge-gate CLI's raw-env path resolves identically to readInputs()", () => {
+  it("agrees on TRIGGER_PHRASE for the raw, untrimmed string the runner hands it", () => {
+    const raw = "  @review-bot  ";
+    setInput("TRIGGER_PHRASE", raw);
+    // readInputs() goes through core.getInput (which trims); the CLI passes `raw`
+    // straight in. Both must land on the same phrase.
+    expect(parseTriggerPhrase(raw)).toBe(readInputs().triggerPhrase);
+    expect(parseTriggerPhrase("")).toBe(DEFAULT_TRIGGER_PHRASE);
+  });
+
+  it("agrees on MIN_TRIGGER_PERMISSION, including the warned fallback", () => {
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
+    for (const raw of ["admin", "  ADMIN ", "write", "maintain", ""]) {
+      setInput("MIN_TRIGGER_PERMISSION", raw);
+      expect(parseMinTriggerPermission(raw)).toBe(readInputs().minTriggerPermission);
+    }
+    // The typo warns through BOTH paths, so the CLI surfaces it too.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('is not "write" or "admin"'));
+  });
+});
+
 describe("string inputs are trimmed", () => {
   it("trims REVIEW_PROMPT_FILE and CODEBASE_OVERVIEW", () => {
     setInput("REVIEW_PROMPT_FILE", "  ./custom-prompt.md  ");
@@ -193,17 +309,9 @@ describe("provider contract (PROVIDER / MODEL_ID / API_KEY)", () => {
     expect(inputs.model).toBe("deepseek/deepseek-v4-pro");
   });
 
-  it("AC-4: PROVIDER=deepseek without MODEL_ID defaults to deepseek-v4-flash", () => {
-    setInput("PROVIDER", "deepseek");
-    const inputs = readInputs();
-    expect(inputs.provider).toBe("deepseek");
-    expect(inputs.model).toBe("deepseek-v4-flash");
-  });
-
-  it("honors an explicit MODEL_ID over the per-provider default", () => {
-    setInput("PROVIDER", "deepseek");
-    setInput("MODEL_ID", "deepseek-v4-pro");
-    expect(readInputs().model).toBe("deepseek-v4-pro");
+  it("honors an explicit MODEL_ID over the default", () => {
+    setInput("MODEL_ID", "anthropic/claude-sonnet-4-5");
+    expect(readInputs().model).toBe("anthropic/claude-sonnet-4-5");
   });
 
   it("reads the API_KEY input", () => {
@@ -216,62 +324,93 @@ describe("provider contract (PROVIDER / MODEL_ID / API_KEY)", () => {
     expect(() => readInputs()).toThrow(/API_KEY is required/);
   });
 
-  it("PROVIDER=minimax without MODEL_ID defaults to MiniMax-M3", () => {
-    setInput("PROVIDER", "minimax");
-    const inputs = readInputs();
-    expect(inputs.provider).toBe("minimax");
-    expect(inputs.model).toBe("MiniMax-M3");
+  it("does not require API_KEY on a pull_request_review_comment run (the no-model settle pass)", () => {
+    setInput("API_KEY", "");
+    process.env["GITHUB_EVENT_NAME"] = "pull_request_review_comment";
+    expect(readInputs().apiKey).toBe("");
   });
 
-  it("PROVIDER=kimi without MODEL_ID defaults to kimi-k2.7-code", () => {
-    setInput("PROVIDER", "kimi");
-    const inputs = readInputs();
-    expect(inputs.provider).toBe("kimi");
-    expect(inputs.model).toBe("kimi-k2.7-code");
+  it("still requires API_KEY on every event that can reach the model", () => {
+    setInput("API_KEY", "");
+    for (const event of ["pull_request", "issue_comment"]) {
+      process.env["GITHUB_EVENT_NAME"] = event;
+      expect(() => readInputs()).toThrow(/API_KEY is required/);
+    }
   });
 
-  it("accepts PROVIDER=moonshot as an alias of kimi (the vendor's former branding)", () => {
-    setInput("PROVIDER", "moonshot");
-    const inputs = readInputs();
-    expect(inputs.provider).toBe("kimi");
-    expect(inputs.model).toBe("kimi-k2.7-code");
+  it("resolves PROVIDER=openrouter case-insensitively, whitespace and all", () => {
+    setInput("PROVIDER", "  OpenRouter ");
+    expect(readInputs().provider).toBe("openrouter");
   });
 
   it("AC-6: an unsupported PROVIDER throws, naming the supported set and the workaround", () => {
     setInput("PROVIDER", "openai");
     expect(() => readInputs()).toThrow(
-      /is not supported \(supported: openrouter, deepseek, minimax, kimi\)/,
+      /is not supported \(supported: openrouter, openai-compatible\)/,
     );
     expect(() => readInputs()).toThrow(/PROVIDER:"openrouter"/);
+    expect(() => readInputs()).toThrow(/https:\/\/openrouter\.ai\/models/);
   });
 
-  it("resolves PROVIDER case-insensitively", () => {
-    setInput("PROVIDER", "DeepSeek");
-    expect(readInputs().provider).toBe("deepseek");
+  it("throws on a REMOVED native provider instead of silently routing its key to OpenRouter", () => {
+    // A workflow still pinned to a native vendor carries THAT vendor's key; accepting the
+    // input and sending it to OpenRouter would 401 mid-review. The error points at the
+    // CATALOG rather than a composed id: a vendor's OpenRouter namespace is not always
+    // the PROVIDER spelling (Kimi publishes as "moonshotai"), so interpolating the
+    // spelling would hand the reader an id OpenRouter does not serve.
+    for (const removed of ["deepseek", "minimax", "kimi", "moonshot"]) {
+      setInput("PROVIDER", removed);
+      expect(() => readInputs()).toThrow(
+        new RegExp(
+          `PROVIDER "${removed}" is not supported \\(supported: openrouter, openai-compatible\\)`,
+        ),
+      );
+      expect(() => readInputs()).toThrow(/https:\/\/openrouter\.ai\/models/);
+      // Never a guessed namespace built from the spelling the user typed.
+      expect(() => readInputs()).not.toThrow(new RegExp(`MODEL_ID:"${removed}/`));
+    }
   });
 
-  it("warns when a deepseek MODEL_ID looks like an OpenRouter id (slash namespace)", () => {
-    setInput("PROVIDER", "deepseek");
-    setInput("MODEL_ID", "deepseek/deepseek-v4-pro");
+  it("never warns about a namespaced MODEL_ID — OpenRouter ids are namespaced by design", () => {
     const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
-    readInputs();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("looks like an OpenRouter id"));
-  });
-
-  it("warns for the other native providers too, naming that provider's own default id", () => {
-    setInput("PROVIDER", "kimi");
+    // The action's own default is namespaced, so the untouched config must stay silent…
+    expect(readInputs().model).toBe(DEFAULT_MODEL);
     setInput("MODEL_ID", "moonshotai/kimi-k2");
-    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
-    readInputs();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('PROVIDER is "kimi"'));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('"kimi-k2.7-code"'));
-  });
-
-  it("never warns about a slash for openrouter, whose ids are namespaced by design", () => {
-    setInput("PROVIDER", "openrouter");
-    setInput("MODEL_ID", "moonshotai/kimi-k2");
-    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
     readInputs();
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns on a BARE MODEL_ID — a half-done migration off a removed native backend", () => {
+    // PROVIDER flipped to the default but MODEL_ID left on the vendor's own bare id is
+    // the shape every migrating workflow starts from, and OpenRouter rejects it. Warn
+    // at input-read time rather than letting the run 400 at the first model call.
+    setInput("MODEL_ID", "deepseek-v4-flash");
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
+    expect(readInputs().model).toBe("deepseek-v4-flash");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('is not namespaced (no "/")'));
+    // Points at the catalog, not a guessed id for some other vendor.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("https://openrouter.ai/models"));
+  });
+});
+
+describe("Jev opt-in", () => {
+  it("defaults off with a pinned OpenRouter model", () => {
+    expect(readInputs()).toMatchObject({ jevEnabled: false, jevModel: "typesafe/jev-1.13" });
+  });
+  it("reuses API_KEY and accepts a model override", () => {
+    setInput("JEV_ENABLED", "true");
+    setInput("JEV_MODEL_ID", "typesafe/jev-1.13");
+    expect(readInputs()).toMatchObject({
+      jevEnabled: true,
+      apiKey: "sk-test",
+      jevModel: "typesafe/jev-1.13",
+    });
+  });
+  it("rejects explicitly enabled native providers", () => {
+    setInput("JEV_ENABLED", "true");
+    setInput("PROVIDER", "deepseek");
+    expect(() => readInputs()).toThrow(
+      /is not supported \(supported: openrouter, openai-compatible\)/,
+    );
   });
 });

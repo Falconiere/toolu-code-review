@@ -1,23 +1,17 @@
-// llm/reviewWithModel.ts — the provider-agnostic review LLM call, via the Vercel AI SDK.
-// One model, structured output (the Zod Verdict schema), temperature 0. Review calls
-// STREAM (streamVerdict.ts), so a response cut at max_tokens comes back as a returned
-// outcome carrying the findings completed before the cut instead of a thrown parse
-// failure; the cartographer's raw-JSON call stays on generateObject. The backend is
-// chosen by resolveModel() (providers.ts), the budget policy and salvage wording live in
-// budget.ts, and this file owns only the LOOP (timeout/abort, hang retries, budget
-// escalation, salvage, abstain). The export is reviewWithModel().
+// llm/reviewWithModel.ts — the review LLM call, via the Vercel AI SDK. One model,
+// structured output (the Zod Verdict schema), temperature 0. Review calls STREAM
+// (streamVerdict.ts), so a response cut at max_tokens comes back as a returned outcome
+// carrying the findings completed before the cut instead of a thrown parse failure; the
+// cartographer's raw-JSON call stays on generateObject. The backend client is built by
+// resolveModel() (providers.ts), the budget policy and salvage wording live in budget.ts,
+// and this file owns only the LOOP (timeout/abort, hang retries, budget escalation,
+// salvage, abstain). The export is reviewWithModel().
 //
-// REASONING-OFF: every provider that offers a switch has hidden reasoning DISABLED,
-// because reasoning tokens are billed against max_tokens — a thinking model spends the
-// whole budget before emitting a byte of JSON and returns finish_reason "length" with
-// empty content. Each backend spells it differently and every spelling lives in
+// REASONING-OFF (OpenRouter): hidden reasoning is DISABLED, because reasoning tokens are billed
+// against max_tokens — a thinking model spends the whole budget before emitting a byte of
+// JSON and returns finish_reason "length" with empty content. The spelling lives in
 // providers.ts: OpenRouter's `reasoning:{effort:"none"}` (plus require_parameters) is
-// baked into the client via OPENROUTER_EXTRA_BODY, while native DeepSeek's and MiniMax's
-// `thinking:{type:"disabled"}` ride on the CALL via providerOptionsFor(). Kimi offers no
-// switch on its current models, so for it (and for MiniMax's M2.x ids, which ignore the
-// switch) providers.ts marks an EMPTY length cut as budget-recoverable instead — see
-// escalatesEmptyCut() and the catch below. Per-provider proofs: request-shape.test.ts,
-// deepseek.test.ts, minimax.test.ts, kimi.test.ts.
+// baked into the client via OPENROUTER_EXTRA_BODY. Wire proof: request-shape.test.ts.
 //
 // RECOVER-THEN-ABSTAIN: the call throws on empty content, a JSON parse or schema
 // validation failure, or an API error (after retries). We CATCH every throw; recover()
@@ -26,12 +20,7 @@
 // Never throw to the caller, never return a null verdict: a failed call abstains, it
 // does not block.
 import { generateObject } from "ai";
-import {
-  escalatesEmptyCut,
-  providerOptionsFor,
-  resolveModel,
-  type ProviderId,
-} from "./providers.js";
+import { resolveModel } from "./providers.js";
 import type { Finding } from "./schema.js";
 import {
   abstain,
@@ -44,6 +33,7 @@ import {
 } from "./recover.js";
 import { budgetExhausted, isProviderCap, nextBudget } from "./budget.js";
 import { streamVerdict } from "./streamVerdict.js";
+import { wallDeadlineResult, wallTimeLeft } from "./wallDeadline.js";
 import type { Envelope } from "@/prompt.js";
 
 /**
@@ -53,7 +43,8 @@ import type { Envelope } from "@/prompt.js";
  * used to burn the whole budget and abstain with zero recovery, even though the
  * same request usually succeeds. So each ATTEMPT gets this budget; a hung attempt
  * is aborted and RETRIED up to {@link MAX_ATTEMPTS} with a fresh attempt, for a
- * total ceiling of ≈ MAX_ATTEMPTS × this. A final-attempt abort salvages whatever
+ * total ceiling of ≈ MAX_ATTEMPTS × this, bounded by the shared wall deadline.
+ * A final-attempt abort salvages whatever
  * prefix arrived, or abstains as a timeout when none ever did.
  * Input-overridable via {@link ReviewOptions.timeoutMs} (REQUEST_TIMEOUT_MS input).
  *
@@ -72,13 +63,17 @@ export const REQUEST_TIMEOUT_MS = 180_000;
  */
 export const MAX_ATTEMPTS = 3;
 
-/** Options for {@link reviewWithModel}: the provider, model id, API key, and test seams. */
+/** Options for {@link reviewWithModel}: the model id, API key, and test seams. */
 export interface ReviewOptions {
-  /** Backend provider; defaults to "openrouter" when omitted (preserves legacy callers). */
-  provider?: ProviderId;
-  /** Model id for the chosen provider (e.g. "deepseek-v4-flash" or "deepseek/deepseek-v4-pro"). */
+  /** Defaults to OpenRouter for existing callers. */
+  provider?: import("./providers.js").ProviderId;
+  /** Explicit API root for the compatible provider. */
+  baseUrl?: string | undefined;
+  /** Custom endpoint request options; OpenRouter rejects these. */
+  extraBody?: Record<string, import("ai").JSONValue> | undefined;
+  /** Model id served by the selected backend. */
   model: string;
-  /** Provider API key (Authorization: Bearer). */
+  /** Bearer key; optional for an unauthenticated custom endpoint. */
   apiKey: string;
   /** Custom fetch — injected by tests to replay recorded responses; real fetch in prod. */
   fetch?: typeof fetch;
@@ -86,6 +81,8 @@ export interface ReviewOptions {
   maxRetries?: number;
   /** Per-attempt deadline in ms before THAT attempt is aborted (default {@link REQUEST_TIMEOUT_MS}). */
   timeoutMs?: number;
+  /** Epoch-ms deadline shared by every model call, retry and token escalation. */
+  wallDeadline?: number | undefined;
   /** Outer attempts against a hang/timeout (default {@link MAX_ATTEMPTS}); each gets its own timeoutMs. */
   maxAttempts?: number;
   /**
@@ -112,6 +109,8 @@ export interface ReviewOptions {
  * (e.g. "length" for the reasoning-budget-exhausted bug).
  */
 export interface ProviderResult {
+  /** Optional enhancement metadata; never changes baseline coverage. */
+  enhancement?: import("@/jev/enhance.js").EnhancementSummary;
   verdict: "approved" | "changes" | "error";
   findings: Finding[];
   review_plan?: string;
@@ -122,6 +121,11 @@ export interface ProviderResult {
   /** True when the result was salvaged from a length-truncated response: the
    *  findings completed before the cut were recovered, later ones may be missing. */
   partial?: boolean;
+  /** Findings the source-evidence gate dropped because their `quoted_line` was not at
+   *  the cited line (pipeline/reviewCall.ts). Ordinary drops: they never cost a file
+   *  its coverage, but they count toward settleVerdict's `removed` and the comment
+   *  says how many were discarded. */
+  unverifiedEvidence?: number;
   /** Set on a salvaged partial whose output budget could grow no further — the ceiling
    *  (budget.ts's MAX_TOKEN_CEILING) was reached, or the provider refused the budget. It
    *  is what tells the reader (via the budget.ts wording) that MAX_TOKENS is no longer
@@ -138,14 +142,13 @@ export interface ProviderResult {
    * retries, DNS/connection errors): an APICallError or a bare fetch failure, never
    * NoObjectGeneratedError.
    */
-  failure?: "schema" | "transport" | "timeout";
+  failure?: "schema" | "transport" | "timeout" | "evidence" | "coverage";
 }
 
 /**
- * Run one structured code review against the configured provider's model. Delegates the
- * call to {@link streamVerdict} (schema + temperature 0); the backend client (and any
- * provider-specific request-body extras) comes from {@link resolveModel} — OpenRouter
- * sends the reasoning-off + require_parameters extras, native DeepSeek sends neither.
+ * Run one structured code review against the configured model. Delegates the call to
+ * {@link streamVerdict} (schema + temperature 0); the backend client, carrying the
+ * reasoning-off + require_parameters extras, comes from {@link resolveModel}.
  * NEVER throws: any failure after retries (empty content, parse/validation error, API
  * error) is caught and returned as a verdict:"error" abstention.
  */
@@ -153,23 +156,19 @@ export async function reviewWithModel(
   envelope: Envelope,
   opts: ReviewOptions,
 ): Promise<ProviderResult> {
-  const provider = opts.provider ?? "openrouter";
   const model = resolveModel({
-    provider,
+    provider: opts.provider,
+    baseUrl: opts.baseUrl,
+    extraBody: opts.extraBody,
     model: opts.model,
     apiKey: opts.apiKey,
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
   });
-  // Per-CALL request-body extras (native DeepSeek's and MiniMax's reasoning switch);
-  // OpenRouter's equivalent is baked into the client by resolveModel, so it is undefined
-  // there, and Kimi has none (its temperature gate is a model middleware, also in
-  // resolveModel).
-  const providerOptions = providerOptionsFor(provider);
   const perAttemptMs = opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
   const maxAttempts = opts.maxAttempts ?? MAX_ATTEMPTS;
 
   // TWO INDEPENDENT COUNTERS, because the failures they answer are unrelated:
-  //   `attempt`     — hang retries (≤ maxAttempts), each with its OWN deadline and a fresh
+  //   `attempt`     — hang retries (≤ maxAttempts), each capped by the shared deadline and a fresh
   //                   AbortController; the SDK never retries an abort, so we do. .unref()
   //                   keeps a pending timer from holding the process open; cleared in
   //                   finally on the normal (fast) path.
@@ -186,12 +185,19 @@ export async function reviewWithModel(
   let best: Prefix | undefined;
 
   while (attempt <= maxAttempts) {
+    const remainingMs = wallTimeLeft(opts.wallDeadline);
+    if (remainingMs === 0) return wallDeadlineResult(best);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), perAttemptMs);
+    const wallLimited = remainingMs <= perAttemptMs;
+    const timeout = setTimeout(() => controller.abort(), Math.min(perAttemptMs, remainingMs));
     timeout.unref?.();
     const lastAttempt = attempt >= maxAttempts;
 
     try {
+      process.stdout.write(
+        `  ${opts.rawJson === true ? "PR map" : "Review"} attempt ${attempt}/${maxAttempts}, ` +
+          `output budget ${budget}, deadline ${Math.min(perAttemptMs, remainingMs)}ms\n`,
+      );
       const call = {
         model,
         system: envelope.system,
@@ -199,7 +205,6 @@ export async function reviewWithModel(
         maxTokens: budget,
         maxRetries: opts.maxRetries ?? 2,
         abortSignal: controller.signal,
-        providerOptions,
       };
 
       // Raw-JSON mode (the cartographer — see ReviewOptions.rawJson): no schema is
@@ -220,6 +225,9 @@ export async function reviewWithModel(
       if (streamed.outcome === "complete")
         return { ...streamed.object, finishReason: streamed.finishReason };
       best = bestPrefix(best, streamed);
+      if (wallTimeLeft(opts.wallDeadline) === 0 || (wallLimited && controller.signal.aborted)) {
+        return wallDeadlineResult(best);
+      }
       if (streamed.outcome === "truncated") {
         // Headroom left → one more call at a doubled budget, preferring a COMPLETE review
         // over a prefix; not an abort, so no backoff and no hang attempt spent. None left
@@ -235,12 +243,15 @@ export async function reviewWithModel(
       // OUR deadline cut a stream that had produced findings. Retry FIRST (a transient
       // stall usually clears), keeping the prefix as the fallback the last attempt takes.
       if (!lastAttempt) {
-        await hangBackoff(attempt);
+        await hangBackoff(attempt, opts.wallDeadline);
         attempt++;
         continue;
       }
       return salvageResult(best, { reason: "deadline" });
     } catch (err) {
+      if (wallTimeLeft(opts.wallDeadline) === 0 || (wallLimited && controller.signal.aborted)) {
+        return wallDeadlineResult(best);
+      }
       // FIRST, before any other classification: the provider REFUSING this budget (400
       // naming max_tokens). A bigger budget would fail identically, so a retained prefix
       // resolves right here, marked budget-exhausted. With NO prefix we deliberately fall
@@ -254,7 +265,7 @@ export async function reviewWithModel(
       // timeout only when no attempt ever completed a finding.
       if (controller.signal.aborted) {
         if (!lastAttempt) {
-          await hangBackoff(attempt);
+          await hangBackoff(attempt, opts.wallDeadline);
           attempt++;
           continue;
         }
@@ -262,16 +273,13 @@ export async function reviewWithModel(
       }
       // The UNSALVAGEABLE truncations — nothing completed before the cut, so streamVerdict
       // let the SDK's own NoObjectGeneratedError through instead of returning a prefix.
-      // With partial output present the cut landed mid-JSON before the first finding
-      // closed: a doubled budget can still finish it, same as above. Empty content +
-      // finish_reason "length" depends on the provider: where reasoning is switched off
-      // it is the hidden-reasoning bug — the model burned the budget thinking and emitted
-      // nothing, a larger budget only buys MORE reasoning, so it is neither escalated nor
-      // recoverable (the fix is providers.ts's reasoning-off). Where the vendor offers no
-      // switch (Kimi, MiniMax's M2.x ids) the same shape is an honest overrun that a
-      // doubled budget clears, and providers.ts says so via escalatesEmptyCut — per
-      // provider, since on a model whose switch holds the shape cannot occur at all.
-      if (isLengthTruncation(err) && (hasPartialOutput(err) || escalatesEmptyCut(provider))) {
+      // Escalated only WITH partial output: the cut landed mid-JSON before the first
+      // finding closed, so a doubled budget can still finish it, same as above. Empty
+      // content + finish_reason "length" is the hidden-reasoning bug instead — the model
+      // burned the budget thinking and emitted nothing, and a larger budget only buys
+      // MORE reasoning, so that shape is neither escalated nor recoverable (the fix is
+      // providers.ts's reasoning-off).
+      if (isLengthTruncation(err) && hasPartialOutput(err)) {
         const next = nextBudget(budget, escalations);
         if (next !== null) {
           budget = next;
@@ -296,7 +304,7 @@ export async function reviewWithModel(
 
   // Unreachable: every loop path either returns or continues, and the final attempt
   // always returns. Present so TypeScript sees a total function.
-  return abstain(new Error("OpenRouter request failed"), false);
+  return abstain(new Error("Model request failed"), false);
 }
 
 /**
@@ -308,8 +316,8 @@ export async function reviewWithModel(
  * pipeline never finalizes the comment, and the job goes GREEN with the in-progress
  * comment frozen.
  */
-function hangBackoff(attempt: number): Promise<void> {
+function hangBackoff(attempt: number, wallDeadline: number | undefined): Promise<void> {
   return new Promise<void>((resolve) => {
-    setTimeout(resolve, 300 * attempt);
+    setTimeout(resolve, Math.min(300 * attempt, wallTimeLeft(wallDeadline)));
   });
 }

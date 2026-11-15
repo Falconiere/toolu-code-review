@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { compareJev } from "./compare.js";
 // evals/run.ts — the eval harness entry point (AC-16, spec §Eval harness). Run
 // with `bun evals/run.ts --help` (or `bun run eval -- --help`) — exits 0 with
 // no env/key/network. A live run calls the SAME `runReview()` (src/pipeline.ts)
@@ -13,10 +14,9 @@
 // changed files, so evals/fetch.ts fetches the paginated per-file "list pull
 // request files" API instead (no such cap) — see its module doc.
 //
-// NOT part of `bun run check`: evals/ sits outside tsconfig's `include` and is
-// listed in .oxlintrc.json's `ignorePatterns`, and vitest's own `include` glob
-// (src/**/__tests__/**) never reaches here either — see evals/__tests__/ for
-// this file's own tests, run directly with `bun test evals/__tests__`.
+// This file's own tests live in evals/__tests__/ and are `bun:test` specs, not
+// vitest — vitest's `include` glob (src/**/__tests__/**) never reaches them. They
+// run via `bun run test:evals`, which `bun run check` and CI both invoke.
 //
 // METRICS: `strata`/`patternGroups` are recomputed by calling `distill()`
 // ourselves on the identical diff object handed to `runReview` (pure,
@@ -216,7 +216,7 @@ async function main(argv: readonly string[]): Promise<number> {
   }
 
   const apiKey = process.env["API_KEY"] ?? "";
-  if (apiKey === "") {
+  if (apiKey === "" && args.provider === "openrouter") {
     process.stderr.write(
       "API_KEY is required for a live eval run (the same input the action reads).\n" +
         `Set it to your ${args.provider} API key and re-run, e.g.:\n` +
@@ -226,6 +226,13 @@ async function main(argv: readonly string[]): Promise<number> {
   }
 
   try {
+    if (args.compareJev) {
+      const comparison = await compareJev(args, apiKey);
+      const rendered = JSON.stringify(comparison, null, 2) + "\n";
+      process.stdout.write(rendered);
+      if (args.out !== null) writeFileSync(args.out, rendered);
+      return 0;
+    }
     const scorecard = await runLive(args, apiKey);
     process.stdout.write(`\n${renderTable(scorecard)}`);
     if (args.out !== null) {

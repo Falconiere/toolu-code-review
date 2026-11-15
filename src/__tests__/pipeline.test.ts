@@ -1,8 +1,7 @@
-// pipeline.test.ts — END-TO-END pipeline wiring with REAL data, no network, no
-// fabricated review output. A real temp git repo provides the diff, the REAL
-// recorded OpenRouter fixtures drive the LLM via an injected fetch, and a
-// recording fake Octokit captures every API call. The pull_request context is a
-// real GitHub pull_request event payload shape.
+// pipeline.test.ts — END-TO-END pipeline wiring with real git diffs and no network.
+// Recorded OpenRouter responses and a replay of PR #125's published review text
+// drive the LLM through an injected fetch. A recording Octokit captures GitHub
+// calls, and the pull_request context uses the real event payload shape.
 import { describe, it, expect, afterEach } from "vitest";
 import { readFileSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,7 +20,8 @@ import {
 } from "@/state.js";
 import { appendFpMarker } from "@/review/fpmarker.js";
 import { git, setupGitRepo, writeFile, removeRepo } from "@/git/__tests__/helpers.js";
-import { replayCompletion } from "./integration/sse.js";
+import { replayWithSourceQuotes } from "./integration/evidenceReplay.js";
+import { replayCompletion, wantsStream } from "./integration/sse.js";
 
 const FIXTURES = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -33,10 +33,11 @@ const FIXTURES = join(
 
 /** A fetch that replays one recorded OpenRouter chat-completions response — no network.
  *  Review calls stream, so the recorded body is re-served as SSE chunk frames; its
- *  content is untouched (see integration/sse.ts). */
+ *  findings/text are untouched; the explicit evidenceReplay adapter adds source quotes
+ *  from the real outgoing diff for the current protocol. */
 function replayFetch(name: string): typeof fetch {
   const body: unknown = JSON.parse(readFileSync(join(FIXTURES, `${name}.json`), "utf8"));
-  return async (_url, init) => replayCompletion(body, init);
+  return async (_url, init) => replayWithSourceQuotes(body, init);
 }
 
 /** The captured outgoing request body the prompt-routing assertions read. */
@@ -52,7 +53,7 @@ function capturingReplayFetch(
   const body: unknown = JSON.parse(readFileSync(join(FIXTURES, `${name}.json`), "utf8"));
   return async (_url, init) => {
     captured.body = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
-    return replayCompletion(body, init);
+    return replayWithSourceQuotes(body, init);
   };
 }
 
@@ -90,6 +91,7 @@ interface SeedThread {
 function fakeOctokit(
   existing: { id: number; body: string }[] = [],
   seedThreads: SeedThread[] = [],
+  listCommentsError?: Error,
 ): {
   octokit: PipelineOctokit;
   rec: Recorded;
@@ -106,11 +108,14 @@ function fakeOctokit(
     resolved: [],
   };
   // A mutable comment store so a created comment is found on the next list.
+  // Every entry is Bot-authored: findSticky fails closed on any comment it cannot
+  // identify as the bot, so an authorless fake would never be located as sticky.
   const store = existing.map((c, i) => ({
     id: c.id,
     body: c.body,
     created_at: `2026-01-01T00:0${i}:00Z`,
     html_url: `https://github.com/o/r/issues/comments/${c.id}`,
+    user: { login: "toolu-bot[bot]", type: "Bot" },
   }));
   let nextId = 9000;
 
@@ -119,6 +124,7 @@ function fakeOctokit(
       issues: {
         listComments: async (p) => {
           rec.listComments++;
+          if (listCommentsError !== undefined) throw listCommentsError;
           return { data: p.page === 1 ? store : [] };
         },
         createComment: async (p) => {
@@ -130,6 +136,7 @@ function fakeOctokit(
             body: p.body,
             created_at: `2026-06-01T00:00:0${store.length}Z`,
             html_url,
+            user: { login: "toolu-bot[bot]", type: "Bot" },
           });
           return { data: { html_url } };
         },
@@ -242,6 +249,7 @@ function baseInputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
     botLogoUrl: "https://example.com/logo.png",
     reviewMemory: true,
     failOn: new Set<BlockableVerdict>(),
+    approveBelow: "nit",
     verbosity: "compact",
     touluApiKey: "",
     touluApiUrl: "https://api.toolu.sh",
@@ -308,8 +316,8 @@ describe("runReview — end to end", () => {
 
     const result = await runReview(deps);
 
-    // The recorded success fixture's verdict is "changes" (no structured findings).
-    expect(result.verdict).toBe("changes");
+    // The recorded response requests changes but supplies no actionable finding.
+    expect(result.verdict).toBe("error");
     expect(result.findingsCount).toBe(0);
     expect(result.commentUrl).toBeTruthy();
 
@@ -342,11 +350,36 @@ describe("runReview — end to end", () => {
       now: () => 1_700_000_000_000,
     });
 
-    expect(result.verdict).toBe("changes");
+    expect(result.verdict).toBe("error");
     // No new comment created: every post updated the located sticky (id 555).
     expect(rec.created).toEqual([]);
     expect(rec.updated.every((u) => u.comment_id === 555)).toBe(true);
     expect(rec.updated.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("a FAILED comment lookup is an infra error, not a memoryless first run", async () => {
+    // locatePrior must not swallow this and report "no sticky yet": with no sticky id
+    // postInProgress would CREATE a second comment (both then carry markers, so later
+    // runs pick between them by created_at) and `prior: null` would reset history,
+    // recap and the MAX_ROUNDS counter — a silent memory wipe that reports a fresh
+    // verdict as though it were round one.
+    const { dir, headSha } = track(featureRepoWithChange());
+    const { octokit, rec } = fakeOctokit([], [], new Error("403 secondary rate limit"));
+
+    await expect(
+      runReview({
+        inputs: baseInputs(),
+        octokit,
+        context: prContext(headSha),
+        fetch: replayFetch("success"),
+        cwd: dir,
+        now: () => 1_700_000_000_000,
+      }),
+    ).rejects.toThrow(/could not read PR comments/);
+
+    // Nothing was posted, so there is no duplicate sticky and no half-written verdict.
+    expect(rec.created).toEqual([]);
+    expect(rec.updated).toEqual([]);
   });
 
   it("non-trigger event → verdict skip, NO review (no comment, no label, no LLM)", async () => {
@@ -489,7 +522,7 @@ describe("runReview — end to end", () => {
         cwd: dir,
         now: () => 1_700_000_000_000,
       });
-      expect(result.verdict).toBe("changes");
+      expect(result.verdict).toBe("error");
     } finally {
       if (saved === undefined) delete process.env["GITHUB_ACTION_PATH"];
       else process.env["GITHUB_ACTION_PATH"] = saved;
@@ -523,7 +556,7 @@ describe("runReview — end to end", () => {
       now: () => 1_700_000_000_000,
     });
 
-    expect(result.verdict).toBe("changes");
+    expect(result.verdict).toBe("error");
     // It reused the located sticky (memory still works) and posted a marker.
     expect(rec.updated.every((u) => u.comment_id === 777)).toBe(true);
     const lastBody = rec.updated.at(-1)?.body ?? "";
@@ -586,7 +619,7 @@ describe("runReview — end to end", () => {
       now: () => 1_700_000_000_000,
     });
 
-    expect(result.verdict).toBe("changes");
+    expect(result.verdict).toBe("error");
     // No new comment: the located sticky (id 888) is updated in place.
     expect(rec.created).toEqual([]);
     expect(rec.updated.length).toBeGreaterThanOrEqual(1);
@@ -605,10 +638,12 @@ describe("runReview — end to end", () => {
 function routingFetch(routes: Array<[match: string, fixture: string]>): typeof fetch {
   return async (_url, init) => {
     const raw = typeof init?.body === "string" ? init.body : "";
-    const hit = routes.find(([m]) => raw.includes(m));
+    const request: { messages?: { role: string; content: string }[] } = JSON.parse(raw || "{}");
+    const diff = promptDiff(request.messages?.find((m) => m.role === "user")?.content);
+    const hit = routes.find(([m]) => diff.includes(m));
     const fixture = hit ? hit[1] : "approved";
     const body: unknown = JSON.parse(readFileSync(join(FIXTURES, `${fixture}.json`), "utf8"));
-    return replayCompletion(body, init);
+    return replayWithSourceQuotes(body, init);
   };
 }
 
@@ -1099,6 +1134,79 @@ describe("runReview — thread-aware inline reconciliation", () => {
 // network) — proves shouldBlock fires on a genuinely-produced verdict. The gate
 // itself is wired in main.ts; here we assert the decision against the real verdict.
 describe("FAIL_ON merge gate (real pipeline verdict + shouldBlock)", () => {
+  it("rejects source-free claims and PR #125 praise without blocking FAIL_ON=changes", async () => {
+    const dir = setupGitRepo();
+    repos.push(dir);
+    git(dir, "checkout", "-b", "feature", "--quiet");
+    const path = "crates/execution/src/execution/job_runner.rs";
+    const sourceLine = "  let local = start_local_services(config, &msg, &ctx).await?;";
+    writeFile(
+      dir,
+      path,
+      `${Array.from({ length: 94 }, (_, n) => `// context ${n + 1}`).join("\n")}\n${sourceLine}\n`,
+    );
+    git(dir, "add", path);
+    git(dir, "commit", "-m", "add job runner", "--quiet");
+    const headSha = git(dir, "rev-parse", "HEAD").trim();
+    const { octokit, rec } = fakeOctokit();
+    const normalFetch = replayFetch("success");
+    const review = {
+      review_plan: "Review the changed job runner code.",
+      verdict: "changes",
+      findings: [
+        {
+          path,
+          line: 95,
+          severity: "low",
+          confidence: "high",
+          category: "documentation accuracy",
+          quoted_line: sourceLine.trim(),
+          text: "The `start_local_services` call is unchanged. It is still called after context building, which is correct because the context must be available for service configuration.",
+        },
+        {
+          path,
+          line: 95,
+          severity: "high",
+          confidence: "high",
+          quoted_line: "let local = start_local_services(config, &msg, &ctx);",
+          text: "The service startup error is silently ignored.",
+        },
+      ],
+      other_checks: "",
+      top_must_fix: [],
+    };
+    const fetchReview: typeof fetch = async (url, init) =>
+      wantsStream(init)
+        ? replayCompletion(
+            { choices: [{ finish_reason: "stop", message: { content: JSON.stringify(review) } }] },
+            init,
+          )
+        : normalFetch(url, init);
+
+    const result = await runReview({
+      inputs: baseInputs({ failOn: parseFailOn("changes") }),
+      octokit,
+      context: prContext(headSha),
+      fetch: fetchReview,
+      cwd: dir,
+      now: () => 1_700_000_000_000,
+    });
+
+    // The praise is self-negating and the misquoted claim (`.await?` dropped from the
+    // quote) is unverifiable: both are dropped, the file stays reviewed, and nothing
+    // actionable remains — so the review approves instead of reporting itself
+    // incomplete (toolu-ghrunner PR #210).
+    expect(result.verdict).toBe("approved");
+    expect(result.findingsCount).toBe(0);
+    expect(shouldBlock(result.verdict, parseFailOn("changes,error"))).toBe(false);
+    expect(rec.reviews).toEqual([]);
+    const body = rec.updated.at(-1)?.body ?? "";
+    expect(body).toContain("**Unverified findings:** 1 finding(s) dropped");
+    expect(body).not.toContain("Review incomplete");
+    expect(body).not.toContain("Provider error");
+    expect(body).not.toContain("### Findings (1)");
+  });
+
   it("AC-7: a real 'changes' verdict blocks under FAIL_ON=changes, not under none", async () => {
     const { dir, headSha } = track(featureRepoWithChange());
     const { octokit } = fakeOctokit();
@@ -1107,7 +1215,7 @@ describe("FAIL_ON merge gate (real pipeline verdict + shouldBlock)", () => {
       inputs: baseInputs(),
       octokit,
       context: prContext(headSha),
-      fetch: replayFetch("success"),
+      fetch: replayFetch("findings"),
       cwd: dir,
       now: () => 1_700_000_000_000,
     });
@@ -1367,12 +1475,14 @@ function recordingRoutingFetch(
       system: messages.find((m) => m.role === "system")?.content ?? "",
       user: messages.find((m) => m.role === "user")?.content ?? "",
     });
-    const hit = routes.find(([m]) => raw.includes(m));
+    const request: { messages?: { role: string; content: string }[] } = JSON.parse(raw || "{}");
+    const diff = promptDiff(request.messages?.find((m) => m.role === "user")?.content);
+    const hit = routes.find(([m]) => diff.includes(m));
     const fixture = hit ? hit[1] : "approved";
     const fixtureBody: unknown = JSON.parse(
       readFileSync(join(FIXTURES, `${fixture}.json`), "utf8"),
     );
-    return replayCompletion(fixtureBody, init);
+    return replayWithSourceQuotes(fixtureBody, init);
   };
 }
 
@@ -1385,7 +1495,7 @@ function packagePrompts(calls: { system: string; user: string }[]): string[] {
 /** The `## Diff` block of a captured package prompt — the only place it shows code. */
 function promptDiff(prompt: string | undefined): string {
   const user = prompt ?? "";
-  return user.slice(user.indexOf("\n\n## Diff\n"));
+  return user.split("## Diff\n```diff\n")[1]?.split("\n```\n")[0] ?? "";
 }
 
 /** The last posted comment body. */

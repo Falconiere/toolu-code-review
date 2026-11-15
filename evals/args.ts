@@ -3,11 +3,15 @@
 // EvalArgs or throws ArgError — no env reads, no I/O, so `--help` and bad-flag
 // tests never need a key, gh, or a network.
 import {
-  SUPPORTED_PROVIDERS,
+  DEFAULT_MODEL,
+  OPENROUTER_MODELS_URL,
+  PROVIDER_ID,
   canonicalProviderId,
-  defaultModelFor,
+  validateBaseUrl,
   type ProviderId,
 } from "@/llm/providers.js";
+import { parseExtraBody } from "@/llm/extraBody.js";
+import type { JSONValue } from "ai";
 
 /** The default PR the harness targets when `--pr` is omitted (spec §Eval harness). */
 export const DEFAULT_PR = "Falconiere/comemory#72";
@@ -16,10 +20,16 @@ export const DEFAULT_PR = "Falconiere/comemory#72";
  *  on is filled with harmless placeholders — callers check `help` FIRST). */
 export interface EvalArgs {
   help: boolean;
+  compareJev?: boolean;
+  baseSha?: string;
+  headSha?: string;
+  expectations?: string;
   owner: string;
   repo: string;
   prNumber: number;
   provider: ProviderId;
+  baseUrl?: string | undefined;
+  extraBody?: Record<string, JSONValue> | undefined;
   model: string;
   maxWallMs: number;
   out: string | null;
@@ -54,17 +64,23 @@ on PATH.
 
 Options:
   --pr <owner/repo#number>   PR to review (default: ${DEFAULT_PR})
-  --provider <id>            ${SUPPORTED_PROVIDERS.map((p) => `"${p}"`).join(" | ")}
+  --provider <id>            "openrouter" or "openai-compatible"
                               (default: openrouter)
-  --model <id>                Model id for --provider (default: the action's own
-                              per-provider default, see llm/providers.ts)
+  --model <id>                Model id (OpenRouter default: the action's own
+                              ${DEFAULT_MODEL})
+  --base-url <url>            API root for openai-compatible (requires --model)
+  --extra-body <json>         Optional server-specific fields for openai-compatible
   --max-wall-ms <ms>          Soft wall-clock budget forwarded to MAX_WALL_MS
                               (default: 0 = off)
+  --compare-jev              Paired baseline/enhanced review of one exact Git tree
+  --base-sha <sha>            Pin comparison base revision
+  --head-sha <sha>            Pin comparison head revision
+  --expectations <file>       Labeled known defects/false positives (JSON)
   --out <file>                Also write the scorecard as JSON to this path
   --help, -h                  Print this usage and exit 0 (no key/network needed)
 
 Env:
-  API_KEY                     Required for a live run: the PROVIDER's API key.
+  API_KEY                     Bearer key; optional for unauthenticated custom endpoints.
 
 Example:
   API_KEY=sk-or-... bun run eval -- --pr Falconiere/comemory#72 \\
@@ -74,11 +90,17 @@ Example:
 
 /** Read the next argv slot as a flag's value, or throw a clear ArgError. A
  *  value starting with "--" is treated as the NEXT flag, not this one's value
- *  (so `--pr --provider deepseek` reports `--pr` as missing its value instead
- *  of silently swallowing "--provider" as the PR ref). */
+ *  (so `--pr --provider openrouter` reports `--pr` as missing its value instead
+ *  of silently swallowing "--provider" as the PR ref). A BLANK value is missing
+ *  too — empty or whitespace-only: `--model ""` (or `--model "  "`) used to slip
+ *  through and send a blank model id to OpenRouter for a 400 mid-run, instead of
+ *  failing here with the flag named. Every check runs on the TRIMMED value and the
+ *  trimmed value is what's returned: " --pr" must still read as the next flag rather
+ *  than slip past the guard on its leading space, and no caller has to trim again
+ *  (a padded "--pr" ref now parses instead of failing parsePrRef's regex). */
 function requireValue(argv: readonly string[], index: number, flag: string): string {
-  const value = argv[index];
-  if (value === undefined || value.startsWith("--")) {
+  const value = argv[index]?.trim();
+  if (value === undefined || value === "" || value.startsWith("--")) {
     throw new ArgError(`${flag} requires a value.`);
   }
   return value;
@@ -102,11 +124,17 @@ function requireInt(argv: readonly string[], index: number, flag: string): numbe
  */
 export function parseArgs(argv: readonly string[]): EvalArgs {
   let prRef = DEFAULT_PR;
-  let provider: ProviderId = "openrouter";
+  let provider: ProviderId = PROVIDER_ID;
   let model: string | null = null;
+  let baseUrl: string | undefined;
+  let rawExtraBody = "";
   let maxWallMs = 0;
   let out: string | null = null;
   let help = false;
+  let compareJev = false;
+  let baseSha: string | undefined;
+  let headSha: string | undefined;
+  let expectations: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -115,6 +143,18 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
       case "-h":
         help = true;
         break;
+      case "--compare-jev":
+        compareJev = true;
+        break;
+      case "--base-sha":
+        baseSha = requireValue(argv, ++i, "--base-sha");
+        break;
+      case "--head-sha":
+        headSha = requireValue(argv, ++i, "--head-sha");
+        break;
+      case "--expectations":
+        expectations = requireValue(argv, ++i, "--expectations");
+        break;
       case "--pr":
         prRef = requireValue(argv, ++i, "--pr");
         break;
@@ -122,8 +162,13 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
         const raw = requireValue(argv, ++i, "--provider");
         const id = canonicalProviderId(raw);
         if (id === undefined) {
+          // Names the CATALOG, never a composed id — same reason as inputs.ts: a
+          // vendor's OpenRouter namespace is not always its name, so interpolating the
+          // spelling the user typed suggests ids OpenRouter does not serve.
           throw new ArgError(
-            `--provider "${raw}" is not supported (${SUPPORTED_PROVIDERS.join(", ")}).`,
+            `--provider "${raw}" is not supported (${PROVIDER_ID}, openai-compatible). ` +
+              `Route a vendor's models through OpenRouter with --model <id>, ` +
+              `looked up at ${OPENROUTER_MODELS_URL}.`,
           );
         }
         provider = id;
@@ -131,6 +176,12 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
       }
       case "--model":
         model = requireValue(argv, ++i, "--model");
+        break;
+      case "--base-url":
+        baseUrl = requireValue(argv, ++i, "--base-url");
+        break;
+      case "--extra-body":
+        rawExtraBody = requireValue(argv, ++i, "--extra-body");
         break;
       case "--max-wall-ms":
         maxWallMs = requireInt(argv, ++i, "--max-wall-ms");
@@ -143,9 +194,11 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
     }
   }
 
-  const resolvedModel = model ?? defaultModelFor(provider);
+  const comparison = compareJev ? { compareJev, baseSha, headSha, expectations } : {};
+  const resolvedModel = model ?? DEFAULT_MODEL;
   if (help) {
     return {
+      ...comparison,
       help: true,
       owner: "",
       repo: "",
@@ -157,5 +210,39 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
     };
   }
   const { owner, repo, prNumber } = parsePrRef(prRef);
-  return { help: false, owner, repo, prNumber, provider, model: resolvedModel, maxWallMs, out };
+  if (provider === "openai-compatible") {
+    if (!baseUrl || !model)
+      throw new ArgError("openai-compatible requires --base-url and --model.");
+    if (compareJev) throw new ArgError("--compare-jev requires openrouter.");
+  } else if (baseUrl) {
+    throw new ArgError("--base-url requires --provider openai-compatible.");
+  }
+  if (baseUrl) {
+    try {
+      baseUrl = validateBaseUrl(baseUrl);
+    } catch (error) {
+      throw new ArgError(error instanceof Error ? error.message : "Invalid --base-url.");
+    }
+  }
+  let extraBody: Record<string, JSONValue> | undefined;
+  try {
+    extraBody = parseExtraBody(rawExtraBody);
+  } catch (error) {
+    throw new ArgError(error instanceof Error ? error.message : "Invalid --extra-body.");
+  }
+  if (extraBody && provider !== "openai-compatible")
+    throw new ArgError("--extra-body requires --provider openai-compatible.");
+  return {
+    ...comparison,
+    help: false,
+    owner,
+    repo,
+    prNumber,
+    provider,
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(extraBody ? { extraBody } : {}),
+    model: resolvedModel,
+    maxWallMs,
+    out,
+  };
 }

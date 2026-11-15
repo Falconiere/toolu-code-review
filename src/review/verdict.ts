@@ -1,3 +1,4 @@
+import { enhancementNote } from "@/jev/enhance.js";
 // review/verdict.ts — render the markdown verdict comment and its label. Port of
 // format-verdict.sh: maps the verdict to its PR label + badge, assembles the body
 // (via render.ts), and enforces GitHub's comment-size ceiling by shrinking the
@@ -22,8 +23,10 @@ import {
   type ReviewBody,
 } from "./render.js";
 
-/** GitHub rejects comment bodies over 65536 chars; we rebuild below this ceiling. */
-const BODY_SIZE_LIMIT = 65000;
+/** GitHub rejects comment bodies over 65536 chars; we rebuild below this ceiling.
+ *  Exported so the other size guards (evals/scorecard.ts, verdict-fit.test.ts) read
+ *  the one value instead of mirroring it and drifting. */
+export const BODY_SIZE_LIMIT = 65000;
 
 const DEFAULT_BOT_NAME = "Toolu — Code Review";
 const DEFAULT_BOT_LOGO_URL =
@@ -82,9 +85,11 @@ export class VerdictIntegrityError extends Error {
 
 /**
  * Format the verdict comment body and its PR label.
+ * Model `top_must_fix` is retained in the provider schema for compatibility but
+ * ignored here: Top-N is derived only from the surviving `findings`.
  *
  * @param result - the review result (verdict, findings, review_plan,
- *   other_checks, top_must_fix). A null/empty verdict defaults to "approved"
+ *   other_checks). A null/empty verdict defaults to "approved"
  *   when there are no findings, else "changes" (the bash default).
  * @param opts - branding + the pre-rendered recap/history + the state marker.
  * @returns `{ body, label }` — the full markdown body (marker last) and the bare
@@ -98,23 +103,35 @@ export function formatVerdict(
 ): { body: string; label: string } {
   const findings = result.findings ?? [];
   const verdict = resolveVerdict(result.verdict, findings.length);
-  const { label, badge } = labelAndBadge(verdict);
+  const { label, badge } = labelAndBadge(verdict, result.failure);
 
   const header = buildHeader(opts.duration, opts.jobUrl ?? "https://github.com");
   const marker = opts.historyMarker ?? "";
 
   const body: ReviewBody = {
+    enhancementNote: result.enhancement ? enhancementNote(result.enhancement) : "",
     verdictLabel: `\`${label}\``,
     verdictBadge: badge,
     // Surface the real error + the model's finish_reason when present, so a parse
     // failure ("could not parse") is distinguishable from output truncation ("length").
+    // An evidence failure is the local gate's verdict on a complete response, where the
+    // finish_reason ("stop") only suggests the provider was at fault.
     errorDetail:
       result.error !== undefined && result.error !== ""
-        ? result.error + (result.finishReason ? ` [finish_reason: ${result.finishReason}]` : "")
+        ? result.error +
+          (result.finishReason && result.failure !== "evidence"
+            ? ` [finish_reason: ${result.finishReason}]`
+            : "")
         : "",
-    // "LLM judgment unavailable" keys off the RESOLVED verdict, not errorDetail: a
-    // recovered truncation sets `error` while still delivering findings + a verdict.
-    llmErrored: verdict === "error",
+    evidenceNote: evidenceNote(result.unverifiedEvidence ?? 0),
+    // "LLM judgment unavailable" means the model produced NOTHING. It keys off the
+    // resolved verdict AND the absence of model-authored content — never errorDetail:
+    // a recovered truncation sets `error` while still delivering findings + a verdict.
+    // The verdict alone is not enough either: the source-evidence gate
+    // (pipeline/reviewCall.ts) and the coverage degrade (pipeline/settle.ts) both force
+    // "error" on a review the provider answered in full, whose review plan and
+    // other-checks blurb this very body goes on to render.
+    llmErrored: verdict === "error" && !deliveredJudgment(result, findings),
     header,
     branch: opts.branch ?? "unknown",
     jobUrl: opts.jobUrl ?? "https://github.com",
@@ -122,7 +139,6 @@ export function formatVerdict(
     botLogoUrl: opts.botLogoUrl ?? DEFAULT_BOT_LOGO_URL,
     reviewPlan: result.review_plan ?? "",
     otherChecks: result.other_checks ?? "",
-    topMustFix: result.top_must_fix ?? [],
     findings,
     changedFiles: opts.changedFiles ?? 0,
     // Default compact: only an explicit "full" restores the multi-line checklist.
@@ -140,6 +156,37 @@ export function formatVerdict(
 
   const rendered = fitToSizeLimit(body, marker, opts.ledgerSummary ?? "");
   return { body: rendered, label };
+}
+
+/**
+ * True when the model authored ANY of the judgment this body renders — a review plan
+ * or a surviving finding — or returned findings the source-evidence gate rejected. An
+ * abstention (provider down, response unparseable) carries none of these, so this is
+ * what separates "the LLM never answered" from "the LLM answered and a downstream gate
+ * rejected its findings"; the resolved verdict is "error" in both cases and cannot tell
+ * them apart.
+ *
+ * `other_checks` is NOT consulted: pipeline/settle.ts clears it on every validated
+ * review result, so no review body carries one. If that clearing is ever removed the
+ * clause must come back with it, or a result whose only model content is an
+ * other-checks blurb renders "LLM judgment unavailable" above that very blurb.
+ */
+function deliveredJudgment(result: ProviderResult, findings: Finding[]): boolean {
+  return (
+    (result.review_plan ?? "") !== "" ||
+    findings.length > 0 ||
+    result.failure === "evidence" ||
+    (result.unverifiedEvidence ?? 0) > 0
+  );
+}
+
+/** The note for findings the source-evidence gate dropped as unverifiable ("" → omit). */
+function evidenceNote(count: number): string {
+  if (count === 0) return "";
+  return (
+    `${count} finding(s) dropped: the quoted source was not found at the cited line, ` +
+    "so the claim could not be verified."
+  );
 }
 
 /**
@@ -238,11 +285,20 @@ export function resolveVerdict(
 }
 
 /** Map the verdict to its PR label slug + human badge (the parity-critical table). */
-function labelAndBadge(verdict: ProviderResult["verdict"]): { label: string; badge: string } {
+export function labelAndBadge(
+  verdict: ProviderResult["verdict"],
+  failure?: ProviderResult["failure"],
+): { label: string; badge: string } {
   if (verdict === "approved") {
     return { label: "merge-approved", badge: "✅ Approved" };
   }
   if (verdict === "error") {
+    if (failure === "evidence" || failure === "coverage") {
+      return {
+        label: "request-changes",
+        badge: `🚫 Review incomplete — ${failure === "evidence" ? "source evidence" : "coverage incomplete"}`,
+      };
+    }
     return { label: "request-changes", badge: "🚫 Review incomplete — provider error" };
   }
   return { label: "request-changes", badge: "⚠️ Changes requested" };

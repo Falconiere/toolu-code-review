@@ -1,21 +1,21 @@
 // inputs.ts — read and normalize every action.yml input into a typed ActionInputs
 // object, ONCE, so the pipeline takes a plain typed object and never reads process.env.
 //
-// FLAT PROVIDER CONTRACT (v4): the action runs a SINGLE model, selected by three flat
-// inputs — PROVIDER ("openrouter" | "deepseek" | "minimax" | "kimi"), MODEL_ID, and
-// API_KEY. The old multi-provider PROVIDERS array and the legacy OPENROUTER_API_KEY/MODEL
-// inputs (plus the MERGE_STRATEGY/FALLBACK_MODEL/REVIEW_MODE/ENFORCE_JSON_SCHEMA no-ops)
-// were removed in v4 — a breaking change. PROVIDER defaults to "openrouter"; MODEL_ID defaults per
-// provider (see llm/providers.ts defaultModelFor); an unsupported PROVIDER or an empty
-// API_KEY throws so a misconfig fails loud instead of silently abstaining.
+// OpenRouter defaults are preserved. Custom endpoints require an explicit provider,
+// API root and model id, and may omit API_KEY when their server needs no auth.
 import * as core from "@actions/core";
+import type { JSONValue } from "ai";
+import { parseExtraBody } from "./llm/extraBody.js";
 import {
   type ProviderId,
-  SUPPORTED_PROVIDERS,
-  providerFromNormalized,
-  defaultModelFor,
+  DEFAULT_MODEL,
+  OPENROUTER_MODELS_URL,
+  PROVIDER_ID,
+  canonicalProviderId,
+  validateBaseUrl,
 } from "./llm/providers.js";
-import { parseFailOn, type BlockableVerdict } from "./review/gate.js";
+import { parseApproveBelow, parseFailOn, type BlockableVerdict } from "./review/gate.js";
+import type { Severity } from "./llm/schema.js";
 import { splitGlobs } from "./git/globs.js";
 
 /** Minimum confidence floor for the validate gate (high|medium). */
@@ -23,12 +23,20 @@ export type MinConfidence = "high" | "medium";
 
 /** The fully-resolved, typed inputs the pipeline consumes (no env reads downstream). */
 export interface ActionInputs {
-  /** Resolved backend provider (PROVIDER | "openrouter"); selects the LLM API. */
+  /** Explicit API root for the compatible provider; absent for OpenRouter. */
+  baseUrl?: string | undefined;
+  /** Optional custom server request fields. */
+  extraBody?: Record<string, JSONValue> | undefined;
+  /** Resolved backend provider. */
   provider: ProviderId;
-  /** Effective model id for the provider (MODEL_ID | per-provider default). */
+  /** Effective model id; OpenRouter alone supplies a default. */
   model: string;
-  /** Provider API key (Authorization: Bearer); required, validated non-empty. */
+  /** Bearer key; required for OpenRouter, optional for a custom endpoint. */
   apiKey: string;
+  /** Optional OpenRouter-only assessments; omitted means disabled. */
+  jevEnabled?: boolean;
+  /** Pinned System One model, independent of the generative reviewer. */
+  jevModel?: string;
   /** Max completion tokens per request. */
   maxTokens: number;
   /** Confidence floor for keeping findings. */
@@ -64,8 +72,8 @@ export interface ActionInputs {
   maxChunkLines: number;
   /** Max chunks (= model calls) per review, bounding cost; files beyond are skipped (0 = unlimited). */
   maxChunks: number;
-  /** Soft wall-clock budget (ms) for the whole review loop; packages not yet started
-   *  when it is exceeded are recorded pending and left for a resume run (0 = off). */
+  /** Shared model-work deadline (ms), including in-flight calls and retries.
+   *  Unfinished files remain resumable (600000 by default; 0 explicitly opts out). */
   maxWallMs: number;
   /** Per-attempt model deadline in ms before an attempt is aborted and retried (must fit the model). */
   requestTimeoutMs: number;
@@ -90,6 +98,9 @@ export interface ActionInputs {
   maxRounds: number;
   /** Verdicts that should fail the job (parsed from FAIL_ON; defaults to blocking on "changes"). */
   failOn: ReadonlySet<BlockableVerdict>;
+  /** Lowest finding severity that still withholds the merge-approved label (parsed
+   *  from APPROVE_BELOW; defaults to "nit", preserving "any finding blocks"). */
+  approveBelow: Severity;
   /** Comment verbosity: "compact" (default) collapses the checklist and renders recap
    *  buckets as refs; "full" restores the multi-line checklist and recap text. */
   verbosity: "compact" | "full";
@@ -114,6 +125,20 @@ const DEFAULT_MAX_TOKENS = 8192;
  * 60s deadline aborted most chunks ("This operation was aborted") and abstained.
  */
 const DEFAULT_REQUEST_TIMEOUT_MS = 180000;
+
+/** Ten minutes across all model calls, matching action.yml MAX_WALL_MS. */
+const DEFAULT_MAX_WALL_MS = 600000;
+
+/** A negative wall budget is a typo, never an implicit request for unlimited work. */
+function readWallBudget(): number {
+  const raw = core.getInput("MAX_WALL_MS").trim();
+  const parsed = Number(raw);
+  const budget = raw === "" || !Number.isFinite(parsed) ? DEFAULT_MAX_WALL_MS : parsed;
+  if (!Number.isSafeInteger(budget) || budget < 0) {
+    throw new Error("MAX_WALL_MS must be a non-negative integer (0 explicitly disables it).");
+  }
+  return budget;
+}
 
 /**
  * Parse a string input as a base-10 integer, falling back to `fallback` for an
@@ -187,61 +212,121 @@ function readRulesRef(): "base" | "merge" {
   return "base";
 }
 
-/** Read MIN_TRIGGER_PERMISSION, defaulting to "write"; only "admin" tightens it. */
-function readMinTriggerPermission(): "write" | "admin" {
-  return core.getInput("MIN_TRIGGER_PERMISSION").trim().toLowerCase() === "admin"
-    ? "admin"
-    : "write";
+/** The @mention phrase that re-triggers a review when TRIGGER_PHRASE is unset. */
+export const DEFAULT_TRIGGER_PHRASE = "@toolu";
+
+/**
+ * Parse TRIGGER_PHRASE: trimmed, falling back to {@link DEFAULT_TRIGGER_PHRASE} when
+ * empty. PURE (no `core.getInput`) on purpose — gate/settleCheckCli.ts is a node-type
+ * action, which gets no argv and reads its inputs off `process.env` as `INPUT_*`, so
+ * it cannot go through `readInputs()` and used to hand-duplicate this default. One
+ * parser, two call sites: the merge-gate recompute can no longer drift from the
+ * review run on which phrase settles a finding.
+ */
+export function parseTriggerPhrase(raw: string): string {
+  return raw.trim() || DEFAULT_TRIGGER_PHRASE;
 }
 
 /**
- * Resolve and validate the PROVIDER input. Defaults to "openrouter" when omitted; accepts
- * the aliases providers.ts registers ("moonshot" → "kimi") via its normalized-spelling
- * lookup; THROWS on an unimplemented
- * provider (openai/anthropic/...) so a misconfig fails loud here instead of silently
- * routing through the wrong backend.
+ * Parse MIN_TRIGGER_PERMISSION: only an explicit "admin" (trimmed, case-insensitive)
+ * tightens the @mention permission gate; everything else is "write". An unrecognized
+ * non-empty value is a config typo, so warn before falling back — the shape
+ * {@link readVerbosity} and {@link readRulesRef} use — rather than silently failing
+ * OPEN to the looser gate, which is how a `MIN_TRIGGER_PERMISSION: "maintain"` typo
+ * would quietly let any write-level commenter dismiss a blocker. An empty value is
+ * the normal default and stays silent. Pure, for the same reason
+ * {@link parseTriggerPhrase} is.
  */
+export function parseMinTriggerPermission(raw: string): "write" | "admin" {
+  const token = raw.trim().toLowerCase();
+  if (token === "" || token === "write") return "write";
+  if (token === "admin") return "admin";
+  core.warning(
+    `MIN_TRIGGER_PERMISSION="${token}" is not "write" or "admin"; falling back to write.`,
+  );
+  return "write";
+}
+
+/** Resolve the explicit backend, preserving OpenRouter as the default. */
 function resolveProviderId(raw: string): ProviderId {
-  // Normalized exactly once, here: the empty-default check and the error message need the
-  // normalized text, so the lookup takes it as-is instead of re-normalizing.
+  // Normalized once, here: the empty-default check and the error text both read it.
+  // canonicalProviderId normalizes again on its own, so passing it either spelling is
+  // safe — it is not relying on this call to have done the work.
   const p = raw.trim().toLowerCase();
-  if (p === "") return "openrouter";
-  const id = providerFromNormalized(p);
+  if (p === "") return PROVIDER_ID;
+  const id = canonicalProviderId(p);
   if (id !== undefined) return id;
+  // The advice names the CATALOG, never a composed id. A vendor's OpenRouter namespace is
+  // not always its name — suggesting "${p}/<model>" is how `MODEL_ID:"kimi/<model>"`
+  // shipped, an id OpenRouter does not serve (it publishes Kimi under "moonshotai").
   throw new Error(
-    `PROVIDER "${p}" is not supported (supported: ${SUPPORTED_PROVIDERS.join(", ")}). ` +
-      `To use "${p}" models, set PROVIDER:"openrouter" and MODEL_ID:"${p}/<model>" to route through OpenRouter.`,
+    `PROVIDER "${p}" is not supported (supported: ${PROVIDER_ID}, openai-compatible). ` +
+      `Set PROVIDER:"openrouter" (or omit it) and put the model's OpenRouter id in ` +
+      `MODEL_ID — look it up at ${OPENROUTER_MODELS_URL}, since a vendor's OpenRouter ` +
+      `namespace is not always its name.`,
   );
 }
 
-/** Warn when a native-API model id looks like an OpenRouter id (slash namespace) — the
- *  vendor's own API will 400. Heuristic: current native DeepSeek, MiniMax and Kimi ids
- *  have no "/"; revisit if that ever changes. */
-function warnSuspiciousModel(provider: ProviderId, model: string): void {
-  if (provider !== "openrouter" && model.includes("/")) {
+/**
+ * Warn when MODEL_ID carries no "/" — OpenRouter ids are namespaced `<vendor>/<model>`
+ * and it rejects a bare one. The way to land here is a half-done migration off a removed
+ * native backend: PROVIDER flipped to "openrouter" (or dropped, since it is the default)
+ * while MODEL_ID stayed on the vendor's own bare id ("deepseek-v4-flash", "MiniMax-M3",
+ * "kimi-k2.7-code"). Without this the run reaches the model call and 400s with nothing
+ * pointing at MODEL_ID as the cause. A warning, NOT a throw — so the run still proceeds
+ * and still fails at the model call if the id is genuinely wrong; the warning only names
+ * the likely cause up front. It cannot throw: OpenRouter's catalog is the authority on
+ * what it serves, and this action must not block a newly-added id shape.
+ *
+ * KNOWN GAP: shape-only. A NAMESPACED id that OpenRouter does not serve passes silently —
+ * including "kimi/<model>", which is exactly what this action's own error advised before
+ * the catalog rewrite. Closing that needs the hint attached to the model-call 400 instead,
+ * where every rejected id lands regardless of shape; this check stays because it is free
+ * and fires before a token is spent.
+ */
+function warnBareModelId(model: string): void {
+  if (!model.includes("/")) {
     core.warning(
-      `MODEL_ID "${model}" looks like an OpenRouter id (contains "/") but PROVIDER is "${provider}"; ` +
-        `the native ${provider} API will reject it. Use a native id like "${defaultModelFor(provider)}".`,
+      `MODEL_ID "${model}" is not namespaced (no "/"); OpenRouter model ids are ` +
+        `"<vendor>/<model>" and it will reject this one, failing the review at the first ` +
+        `model call. If it is a native vendor id left over from the removed ` +
+        `deepseek/minimax/kimi backends, find its OpenRouter id at ${OPENROUTER_MODELS_URL} ` +
+        `— the namespace is not always the vendor's name.`,
     );
   }
 }
 
-/**
- * Read every action.yml input and resolve it into a typed {@link ActionInputs}.
- *
- * Resolves the flat PROVIDER/MODEL_ID/API_KEY contract: PROVIDER defaults to
- * "openrouter" (unsupported values throw), MODEL_ID defaults per provider, and an
- * empty API_KEY throws (a keyless review would abstain on every call).
- */
+/** Read and validate action inputs before any model or GitHub work. */
 export function readInputs(): ActionInputs {
   const provider = resolveProviderId(core.getInput("PROVIDER"));
-  const model = core.getInput("MODEL_ID").trim() || defaultModelFor(provider);
-  warnSuspiciousModel(provider, model);
+  const jevEnabled = readBool("JEV_ENABLED", false);
+  const rawBaseUrl = core.getInput("BASE_URL").trim();
+  const extraBody = parseExtraBody(core.getInput("EXTRA_BODY"));
+  const rawModel = core.getInput("MODEL_ID").trim();
+  if (provider === "openai-compatible") {
+    if (!rawBaseUrl) throw new Error("BASE_URL is required for PROVIDER=openai-compatible.");
+    if (!rawModel) throw new Error("MODEL_ID is required for PROVIDER=openai-compatible.");
+    if (jevEnabled) throw new Error("JEV_ENABLED requires PROVIDER=openrouter.");
+  } else if (rawBaseUrl) {
+    throw new Error("BASE_URL requires PROVIDER=openai-compatible.");
+  }
+  if (extraBody && provider !== "openai-compatible")
+    throw new Error("EXTRA_BODY requires PROVIDER=openai-compatible.");
+  const baseUrl = rawBaseUrl ? validateBaseUrl(rawBaseUrl) : undefined;
+  const model = provider === "openai-compatible" ? rawModel : rawModel || DEFAULT_MODEL;
 
   const apiKey = core.getInput("API_KEY").trim();
-  if (apiKey === "") {
+  if (
+    provider === "openrouter" &&
+    apiKey === "" &&
+    process.env["GITHUB_EVENT_NAME"] !== "pull_request_review_comment"
+  ) {
     throw new Error(`API_KEY is required (the ${provider} API key).`);
   }
+  // AFTER the API_KEY guard: a run that is about to die on a missing key must not first
+  // post a ::warning annotation blaming MODEL_ID, which would outlive the throw on the
+  // run summary and point the reader at the wrong input.
+  if (provider === "openrouter") warnBareModelId(model);
 
   // MAX_TOKENS must be a positive budget; MAX_TOKENS="0"/"-1" is a typo that would
   // 400 → silent abstain, so clamp it to the default with a warning.
@@ -249,8 +334,12 @@ export function readInputs(): ActionInputs {
 
   return {
     provider,
+    baseUrl,
+    extraBody,
     model,
     apiKey,
+    jevEnabled,
+    jevModel: core.getInput("JEV_MODEL_ID").trim() || "typesafe/jev-1.13",
     maxTokens,
     // The single-model path always enforces the JSON schema; no longer an input.
     enforceJsonSchema: true,
@@ -272,7 +361,7 @@ export function readInputs(): ActionInputs {
     maxDiffLines: intInput("MAX_DIFF_LINES", 0),
     maxChunkLines: intInput("MAX_CHUNK_LINES", 1500),
     maxChunks: intInput("MAX_CHUNKS", 0),
-    maxWallMs: intInput("MAX_WALL_MS", 0),
+    maxWallMs: readWallBudget(),
     requestTimeoutMs: validateTimeout(
       intInput("REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS),
       "REQUEST_TIMEOUT_MS",
@@ -280,14 +369,15 @@ export function readInputs(): ActionInputs {
     token: core.getInput("TOKEN") || (process.env["GITHUB_TOKEN"] ?? ""),
     appId: core.getInput("APP_ID").trim(),
     appPrivateKey: core.getInput("APP_PRIVATE_KEY"),
-    triggerPhrase: core.getInput("TRIGGER_PHRASE").trim() || "@toolu",
-    minTriggerPermission: readMinTriggerPermission(),
+    triggerPhrase: parseTriggerPhrase(core.getInput("TRIGGER_PHRASE")),
+    minTriggerPermission: parseMinTriggerPermission(core.getInput("MIN_TRIGGER_PERMISSION")),
     botName: core.getInput("BOT_NAME") || "Toolu — Code Review",
     botLogoUrl:
       core.getInput("BOT_LOGO_URL") ||
       "https://raw.githubusercontent.com/falconiere/toolu-ghactions/main/code-review/assets/logo.png",
     reviewMemory: readBool("REVIEW_MEMORY", true),
     failOn: parseFailOn(core.getInput("FAIL_ON") || "changes"),
+    approveBelow: parseApproveBelow(core.getInput("APPROVE_BELOW")),
     verbosity: readVerbosity(),
     touluApiKey: core.getInput("TOOLU_API_KEY").trim(),
     touluApiUrl: core.getInput("TOOLU_API_URL").trim() || "https://api.toolu.sh",

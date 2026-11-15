@@ -1,6 +1,35 @@
 import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { z } from "zod";
 import { validateFindings } from "@/review/validate.js";
 import type { Finding } from "@/llm/schema.js";
+import { pr307Comment } from "./pr307-evidence.js";
+
+const TEST_DIR = dirname(fileURLToPath(import.meta.url));
+const PR175_EVIDENCE = z
+  .object({
+    source: z.object({ path: z.string(), lines: z.record(z.string()) }),
+    comments: z.array(
+      z.object({
+        id: z.number(),
+        path: z.string(),
+        line: z.number(),
+        severity: z.enum(["blocker", "high", "medium", "low", "nit"]),
+        confidence: z.enum(["high", "medium"]),
+        text: z.string(),
+        suggestion: z.string().optional(),
+      }),
+    ),
+  })
+  .parse(JSON.parse(readFileSync(join(TEST_DIR, "fixtures", "pr175-evidence.json"), "utf8")));
+
+function recordedFinding(id: number): Finding {
+  const comment = PR175_EVIDENCE.comments.find((entry) => entry.id === id);
+  if (comment === undefined) throw new Error(`missing recorded PR 175 comment ${id}`);
+  return { ...comment, source: "llm" };
+}
 
 // Real diff coordinates: src/a.ts changed lines 10..14, src/b.ts changed lines 5,6.
 const changed = new Map<string, number[]>([
@@ -19,13 +48,13 @@ describe("validateFindings", () => {
     expect(kept[0]?.text).toBe("real line");
   });
 
-  it("keeps blocker/high findings regardless of confidence", () => {
+  it("applies the confidence floor to blocker/high findings too", () => {
     const findings: Finding[] = [
       { path: "src/a.ts", line: 10, severity: "blocker", text: "blocker no conf" },
       { path: "src/a.ts", line: 11, severity: "high", text: "high low conf", confidence: "medium" },
     ];
     const { findings: kept } = validateFindings(findings, changed, "high");
-    expect(kept.map((f) => f.text)).toEqual(["blocker no conf", "high low conf"]);
+    expect(kept).toEqual([]);
   });
 
   it("drops a medium-confidence low-severity finding under minConfidence=high", () => {
@@ -129,6 +158,10 @@ describe("validateFindings", () => {
       },
     ];
     expect(validateFindings(findings, changed, "high", lineText).findings).toHaveLength(1);
+    const strict = validateFindings(findings, changed, "high", lineText, { requireQuote: true });
+    expect(strict.findings).toEqual(findings);
+    expect(strict.unsupportedEvidence).toBe(0);
+    expect(strict.missingQuotePaths).toEqual([]);
   });
 
   it("skips the quote check when no line text is supplied (backward compatible)", () => {
@@ -143,6 +176,9 @@ describe("validateFindings", () => {
       },
     ];
     expect(validateFindings(findings, changed, "high").findings).toHaveLength(1);
+    expect(
+      validateFindings(findings, changed, "high", undefined, { requireQuote: true }).findings,
+    ).toHaveLength(0);
   });
 
   it("drops an LLM finding that quotes non-empty text on a blank cited line", () => {
@@ -234,5 +270,276 @@ describe("validateFindings", () => {
     validateFindings([junkFinding("No issue."), junkFinding("No violation.")], changed, "high");
     expect(write).toHaveBeenCalledWith("  Dropped 2 self-negating finding(s)\n");
     write.mockRestore();
+  });
+
+  it("requires a source quote for fresh LLM findings while preserving legacy omissions", () => {
+    const finding = recordedFinding(4058954931);
+    const path = PR175_EVIDENCE.source.path;
+    const lineText = new Map<string, Map<number, string>>([
+      [path, new Map([[finding.line, PR175_EVIDENCE.source.lines[String(finding.line)] ?? ""]])],
+    ]);
+    const changed = new Map<string, number[]>([[path, [finding.line]]]);
+
+    expect(validateFindings([finding], changed, "high", lineText).findings).toHaveLength(1);
+    const strict = validateFindings([finding], changed, "high", lineText, {
+      requireQuote: true,
+    });
+    expect(strict.findings).toHaveLength(0);
+    expect(strict.unsupportedEvidence).toBe(1);
+    // The recorded finding carries no quote at all — counted apart from a quote that
+    // was supplied and could not be verified.
+    expect(strict.missingQuote).toBe(1);
+    expect(strict.unverifiedQuote).toBe(0);
+    expect(strict.missingQuotePaths).toEqual([path]);
+  });
+
+  it("counts a supplied-but-unmatchable quote apart from a missing one, and logs both", () => {
+    // Without this split, a run where the gate rejects everything cannot be told apart
+    // from a run where the model never emitted quotes — the PR #109 debugging dead end.
+    const sourceLine = PR175_EVIDENCE.source.lines["142"];
+    if (sourceLine === undefined) throw new Error("missing recorded PR 175 source line 142");
+    const path = PR175_EVIDENCE.source.path;
+    const lineText = new Map<string, Map<number, string>>([[path, new Map([[142, sourceLine]])]]);
+    const findings: Finding[] = [
+      { path, line: 142, severity: "high", text: "no quote at all", confidence: "high" },
+      {
+        path,
+        line: 142,
+        severity: "high",
+        text: "quote from somewhere else",
+        confidence: "high",
+        quoted_line: "const thisTextIsNotOnLine142 = true;",
+      },
+    ];
+
+    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const strict = validateFindings(findings, new Map([[path, [142]]]), "high", lineText, {
+      requireQuote: true,
+    });
+    expect(write).toHaveBeenCalledWith(
+      "  Dropped 2 finding(s) lacking source evidence (1 with no quoted_line, " +
+        "1 whose quote did not match the cited line)\n",
+    );
+    write.mockRestore();
+
+    expect(strict.findings).toHaveLength(0);
+    expect(strict.unsupportedEvidence).toBe(2);
+    expect(strict.missingQuote).toBe(1);
+    expect(strict.unverifiedQuote).toBe(1);
+    // Only the missing quote marks its path; a mismatched quote is an ordinary drop.
+    expect(strict.missingQuotePaths).toEqual([path]);
+  });
+
+  it("strips the recorded prose suggestion without discarding its anchored finding", () => {
+    const sourceLine = PR175_EVIDENCE.source.lines["142"];
+    if (sourceLine === undefined) throw new Error("missing recorded PR 175 source line 142");
+    const finding = { ...recordedFinding(4058954931), line: 142 };
+    const path = PR175_EVIDENCE.source.path;
+    const lineText = new Map<string, Map<number, string>>([[path, new Map([[142, sourceLine]])]]);
+
+    const { findings } = validateFindings([finding], new Map([[path, [142]]]), "high", lineText);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.suggestion).toBeUndefined();
+  });
+
+  it("strips an exact no-op suggestion over the complete source span", () => {
+    const sourceLine = PR175_EVIDENCE.source.lines["142"];
+    if (sourceLine === undefined) throw new Error("missing recorded PR 175 source line 142");
+    const path = PR175_EVIDENCE.source.path;
+    const finding: Finding = {
+      path,
+      line: 142,
+      severity: "high",
+      confidence: "high",
+      text: "Recorded source span must change before a suggestion can be offered.",
+      suggestion: sourceLine,
+    };
+    const { findings } = validateFindings(
+      [finding],
+      new Map([[path, [142]]]),
+      "high",
+      new Map([[path, new Map([[142, sourceLine]])]]),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.suggestion).toBeUndefined();
+  });
+
+  // ── Inverted spans (`end_line < line`) ────────────────────────────────────────
+  // The Verdict schema does not relate `end_line` to `line`, so a model can invert
+  // them. `spanIsInDiff` and `sourceSpan` both looped `line..end_line`, so the body
+  // never ran: the span was "in the diff" vacuously and its source joined to "",
+  // which defeated BOTH suggestion safety checks and rendered a one-click
+  // committable "Suggested change" GitHub would apply over a span nobody read.
+  describe("inverted line..end_line spans", () => {
+    const sourceLine = PR175_EVIDENCE.source.lines["142"];
+    if (sourceLine === undefined) throw new Error("missing recorded PR 175 source line 142");
+    const path = PR175_EVIDENCE.source.path;
+    const lineText = new Map([[path, new Map([[142, sourceLine]])]]);
+    const changedLines = new Map([[path, [142]]]);
+    /** A high-confidence anchored finding carrying `suggestion`, span as given. */
+    const on = (end_line: number | undefined, suggestion: string): Finding => ({
+      path,
+      line: 142,
+      ...(end_line === undefined ? {} : { end_line }),
+      severity: "high",
+      confidence: "high",
+      text: "The prefix edit is discarded on the next name change.",
+      suggestion,
+    });
+    const stripOf = (finding: Finding) =>
+      validateFindings([finding], changedLines, "high", lineText).findings[0]?.suggestion;
+
+    it("is not treated as in-diff, so a genuine patch is stripped", () => {
+      const patch = "onKeyPrefixEdited(); // flipped before the name derives the prefix";
+      expect(stripOf(on(141, patch))).toBeUndefined();
+      // The control: the identical suggestion over a well-formed single-line span
+      // survives, so the strip above is the inverted span's fault, not the text's.
+      expect(stripOf(on(undefined, patch))).toBe(patch);
+    });
+
+    it("does not mark an exact no-op suggestion safe", () => {
+      // `suggestion` IS line 142's real source: applying it changes nothing. Before
+      // the fix `sourceSpan` joined zero lines to "" and the no-op check compared
+      // against that instead of the source, so the empty patch was rendered.
+      expect(stripOf(on(141, sourceLine))).toBeUndefined();
+      expect(stripOf(on(undefined, sourceLine))).toBeUndefined();
+    });
+  });
+});
+
+// Falconiere/toolu-ghrunner PR #210 re-wrapped AGENTS.md. Every finding cited a line
+// that ends mid-sentence, the quote found on no single diff line, and the gate dropped
+// them all — the review then claimed the file was never read. Real post-change lines.
+describe("validateFindings — quotes across hard-wrapped lines (PR #210)", () => {
+  const path = "AGENTS.md";
+  const source = new Map<number, string>([
+    [45, "  `src/foo/bar.rs`."],
+    [46, "- **Unit tests never share a file with prod logic**: sibling `tests/` dir +"],
+    [47, '  one-line include (`#[cfg(test)] #[path = "tests/x.rs"] mod tests;`).'],
+    [48, "  `tests/` trees stay **flat**; crate-root integration tests live in top-level"],
+    [297, "  (two-phase names)/`action_exec`+`support`/`command_parser`/`depth_tracker`/"],
+    [
+      298,
+      "  `file_commands`/`cgroup_join` (reserved)/`service_auth`+`lifecycle`. Step summaries (#83, below) and",
+    ],
+    [299, "  job outputs (#88, below) included. `job_http` (#94: job + accelerated clients"],
+    [300, "  from `RunnerConfig.network`, proxy-credential masks, host/container exports);"],
+  ]);
+  const changed = new Map([[path, [...source.keys()]]]);
+  const lineText = new Map([[path, source]]);
+  const quoting = (line: number, quoted_line: string): Finding => ({
+    path,
+    line,
+    quoted_line,
+    severity: "low",
+    confidence: "high",
+    text: "The compressed doc refers to sections that no longer exist.",
+  });
+  const check = (finding: Finding) =>
+    validateFindings([finding], changed, "high", lineText, { requireQuote: true });
+
+  it("keeps a sentence quoted across the cited line and the next one", () => {
+    const sameLine = check(
+      quoting(298, "Step summaries (#83, below) and job outputs (#88, below) included."),
+    );
+    expect(sameLine.findings).toHaveLength(1);
+    // Newline-joined, as a model copying two diff lines would emit it.
+    const twoLines = check(
+      quoting(46, "sibling `tests/` dir +\n  one-line include (`#[cfg(test)] #[path"),
+    );
+    expect(twoLines.findings).toHaveLength(1);
+  });
+
+  it("keeps a sentence that starts on the line before the cited one", () => {
+    const result = check(quoting(299, "Step summaries (#83, below) and job outputs (#88, below)"));
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it("keeps a quote that copied the Lnnn: prefix and diff marker", () => {
+    const result = check(
+      quoting(46, "L46: +- **Unit tests never share a file with prod logic**: sibling"),
+    );
+    expect(result.findings).toHaveLength(1);
+  });
+
+  it("drops a quote taken wholly from a neighbouring line", () => {
+    const result = check(quoting(46, "`src/foo/bar.rs`."));
+    expect(result.findings).toHaveLength(0);
+    expect(result.unverifiedQuote).toBe(1);
+    expect(result.missingQuotePaths).toEqual([]);
+  });
+
+  it("drops a quote of a removed line even with its prefix copied", () => {
+    const result = check(quoting(46, "L---: -- **Unit tests live beside prod logic**"));
+    expect(result.findings).toHaveLength(0);
+    expect(result.unverifiedQuote).toBe(1);
+  });
+
+  it("never joins across a gap between hunks", () => {
+    // Lines 48 and 297 sit in different hunks: their texts are never adjacent.
+    const result = check(quoting(48, "live in top-level (two-phase names)"));
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it("never joins across a gap INSIDE a wide line..end_line span", () => {
+    // The same stitched quote, but the finding now cites a span wide enough to cover
+    // both hunks. Only `line` is anchored by the diff check, so `end_line: 299` used
+    // to turn the two hunks into one contiguous string and satisfy the gate with a
+    // quote that occurs nowhere in the post-change source.
+    const stitched: Finding = {
+      ...quoting(46, "live in top-level (two-phase names)"),
+      end_line: 299,
+    };
+    const result = check(stitched);
+    expect(result.findings).toHaveLength(0);
+    expect(result.unverifiedQuote).toBe(1);
+    expect(result.missingQuotePaths).toEqual([]);
+  });
+
+  it("still keeps a real quote lying wholly inside one hunk of a wide span", () => {
+    // The control for the case above: a wide span is not rejected as such, only a
+    // quote that bridges the gap inside it. This one crosses 298→299, both present.
+    const wide: Finding = {
+      ...quoting(297, "Step summaries (#83, below) and job outputs (#88, below) included."),
+      end_line: 299,
+    };
+    const result = check(wide);
+    expect(result.findings).toHaveLength(1);
+    expect(result.unverifiedQuote).toBe(0);
+  });
+});
+
+// Falconiere/comemory PR #307: the model reasons inside `text` and concludes "no
+// defect" only at its end. `conclusion` is its structured way to withdraw.
+describe("validateFindings — Finding.conclusion (PR #307)", () => {
+  /** A recorded PR #307 comment as a finding anchored on its own (changed) line. */
+  function anchored(id: number, conclusion?: Finding["conclusion"]) {
+    const c = pr307Comment(id);
+    const finding: Finding = {
+      path: c.path,
+      line: c.line,
+      severity: c.severity,
+      confidence: "high",
+      source: "llm",
+      text: c.text,
+      ...(conclusion === undefined ? {} : { conclusion }),
+    };
+    return { finding, changedLines: new Map([[c.path, [c.line]]]) };
+  }
+
+  it("drops a no_defect conclusion and counts it as self-negating", () => {
+    const { finding, changedLines } = anchored(4116107429, "no_defect");
+    const result = validateFindings([finding], changedLines, "high");
+    expect(result.findings).toEqual([]);
+    expect(result.selfNegating).toBe(1);
+  });
+
+  it("keeps the same real finding when conclusion is defect or absent", () => {
+    for (const conclusion of ["defect", undefined] as const) {
+      const { finding, changedLines } = anchored(4116107429, conclusion);
+      const result = validateFindings([finding], changedLines, "high");
+      expect(result.findings).toEqual([finding]);
+      expect(result.selfNegating).toBe(0);
+    }
   });
 });

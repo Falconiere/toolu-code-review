@@ -4,10 +4,9 @@ description: |
   against an 8-dimension checklist (correctness, security, performance, test
   coverage, doc accuracy, tight assertions, migration warnings, and adherence
   to the project's own convention files read from the base ref) and posts a
-  structured verdict with actionable findings. Runs on OpenRouter (any
-  OpenAI-compatible model) or a vendor's native API — DeepSeek, MiniMax, or
-  Kimi (Moonshot AI) — via the Vercel AI SDK with structured-output validation
-  and retries.
+  structured verdict with actionable findings. Runs on OpenRouter or a custom
+  OpenAI-compatible endpoint via the Vercel AI SDK, with structured-output
+  validation and retries.
 author: 'Falconiere'
 branding:
   icon: 'check-circle'
@@ -15,21 +14,35 @@ branding:
 
 inputs:
   PROVIDER:
-    description: 'LLM backend: "openrouter" (default — any OpenAI-compatible model via OpenRouter), or a vendor''s native API, billed to that vendor''s own key: "deepseek" (api.deepseek.com), "minimax" (api.minimax.io), or "kimi" (Moonshot AI, api.moonshot.ai; "moonshot" is accepted as an alias). Any other value fails with an error.'
+    description: 'LLM backend: "openrouter" (default) or "openai-compatible" for a custom endpoint. Custom endpoints require BASE_URL and MODEL_ID. Native vendor provider names remain unsupported; find their OpenRouter model ids at https://openrouter.ai/models.'
     required: false
     default: 'openrouter'
   MODEL_ID:
-    description: 'Model id for the chosen provider. Defaults per provider: openrouter -> deepseek/deepseek-v4-pro, deepseek -> deepseek-v4-flash, minimax -> MiniMax-M3, kimi -> kimi-k2.7-code. Use a "<vendor>/<model>" id for OpenRouter; a bare native id (no vendor prefix, e.g. "deepseek-v4-flash", "MiniMax-M3", "kimi-k3") for the native providers.'
+    description: 'Model id. OpenRouter defaults to deepseek/deepseek-v4-pro; openai-compatible requires an explicit model id served by your endpoint.'
+    required: false
+  BASE_URL:
+    description: 'API root for PROVIDER=openai-compatible, including /v1 when needed (e.g. http://127.0.0.1:8000/v1). Must be reachable from the CI runner. Do not include /chat/completions, credentials, query parameters or fragments. Rejected for OpenRouter.'
     required: false
   API_KEY:
-    description: 'API key for the chosen provider (Authorization: Bearer). Required. Prefer passing via a step-level env: block for better secret hygiene.'
-    required: true
+    description: 'Bearer API key. Required for OpenRouter except on the no-model pull_request_review_comment settle pass. Optional for a custom endpoint without authentication. Prefer passing via a step-level env: block for better secret hygiene.'
+    required: false
+  EXTRA_BODY:
+    description: 'Optional JSON object of server-specific fields for openai-compatible (e.g. {"chat_template_kwargs":{"enable_thinking":false}} for oMLX). Cannot override model, messages, token budget, temperature, response format, streaming or tools. Rejected for OpenRouter.'
+    required: false
+  JEV_ENABLED:
+    description: 'Opt in to Jev finding assessment and risk routing. Requires PROVIDER=openrouter; reuses API_KEY and the shared review deadline.'
+    required: false
+    default: 'false'
+  JEV_MODEL_ID:
+    description: 'OpenRouter System One model for optional assessments.'
+    required: false
+    default: 'typesafe/jev-1.13'
   MAX_TOKENS:
-    description: 'Max completion tokens per request. Always sent — omitting it makes the provider reserve the model''s full output capacity against your credit budget. A truncated (finish_reason "length") chunk is retried with a DOUBLED budget, up to 4 times and never past the 131072 ceiling (8192 -> 16384 -> 32768 -> 65536 -> 131072); those escalations are counted separately from the hang/timeout retries, so neither eats the other. When the budget still runs out, the findings completed before the cut are kept (a partial review) instead of the chunk being lost, and the comment says whether raising this value or lowering MAX_CHUNK_LINES is the fix. Kimi''s current models (and MiniMax''s M2.x ids) reason on every call and bill that reasoning against this budget too; a response that ran out before any JSON started is retried at the doubled budget on those providers.'
+    description: 'Max completion tokens per request. Rarely needs tuning: always sent (omitting it makes the provider reserve the model''s full output capacity against your credit budget), and a truncated (finish_reason "length") chunk is retried with a DOUBLED budget, up to 4 times and never past the 131072 ceiling (8192 -> 16384 -> 32768 -> 65536 -> 131072); those escalations are counted separately from the hang/timeout retries, so neither eats the other. When the budget still runs out, the findings completed before the cut are kept (a partial review) instead of the chunk being lost, and the comment says whether raising this value or lowering MAX_CHUNK_LINES is the fix.'
     required: false
     default: '8192'
   MIN_CONFIDENCE:
-    description: 'Drop findings below this confidence unless severity is blocker/high. One of: high, medium'
+    description: 'Drop findings below this confidence at every severity, including blocker/high. One of: high, medium'
     required: false
     default: 'high'
   INLINE_COMMENTS:
@@ -79,7 +92,7 @@ inputs:
     required: false
     default: '0'
   MAX_CHUNK_LINES:
-    description: 'Per-chunk diff-line budget. When the diff exceeds this, it is split into chunks of whole files (≤ this many primed lines each) reviewed in separate model calls and merged — so large PRs no longer overwhelm one call. 0 = never chunk (single call). Default 1500. LOWER THIS when a review reports its output budget at the ceiling (MAX_TOKENS cannot go past 131072): smaller chunks need less output per call, which is the only remaining fix once the budget escalation has run out of room.'
+    description: 'Per-chunk diff-line budget. Leave at the default: when the diff exceeds it, the review is split into chunks of whole files (≤ this many primed lines each) reviewed in separate model calls and merged — so large PRs no longer overwhelm one call. 0 = never chunk (single call). Default 1500. Change ONLY when a review comment explicitly names this knob (output budget at the ceiling and MAX_TOKENS cannot go past 131072): smaller chunks need less output per call, which is the only remaining fix once the budget escalation has run out of room.'
     required: false
     default: '1500'
   MAX_CHUNKS:
@@ -87,9 +100,9 @@ inputs:
     required: false
     default: '0'
   MAX_WALL_MS:
-    description: 'Soft wall-clock budget in milliseconds for the whole review loop. 0 (default) = off. When the budget is exceeded mid-run, packages not yet started are recorded as pending in the coverage ledger instead of being attempted, and the round is resumable — via `@toolu resume`, a plain re-run, or automatically on the next push.'
+    description: 'Shared model-work deadline in milliseconds, including cartography, retries, backoff and token escalation. Default 600000 (10 min); 0 explicitly disables it. Active calls abort at the deadline; recovered findings remain partial, attempted files stay unreviewed and unstarted files stay pending for resume. Publishing happens outside this budget; use a workflow job timeout as an outer ceiling.'
     required: false
-    default: '0'
+    default: '600000'
   REQUEST_TIMEOUT_MS:
     description: 'Per-attempt model deadline in milliseconds. Each chunk gets up to this long per attempt (retried a few times) before it is aborted and the chunk abstains ("This operation was aborted"). Raise it for slow/large models, lower it to fail faster. Default 180000 (3 min).'
     required: false
@@ -125,7 +138,7 @@ inputs:
     required: false
     default: 'true'
   MAX_ROUNDS:
-    description: 'Review-round surrender cap. A generative reviewer can produce a fresh findings batch on every push, so "zero findings" is not a reachable fixpoint on some PRs and a "changes" verdict would block forever. When set to N > 0 and this is review round N (or later; rounds counted from the REVIEW_MEMORY history), a "changes" verdict whose findings are ALL below blocker severity is downgraded to "approved" — the findings stay listed as advisory, the comment carries an explicit "Round cap" callout, and FAIL_ON stops failing the job. A single blocker finding disables the cap for that round. Requires REVIEW_MEMORY. 0 (default) = never surrender.'
+    description: 'Review-round surrender cap. A generative reviewer can produce a fresh findings batch on every push, so "zero findings" is not a reachable fixpoint on some PRs and a "changes" verdict would block forever. When set to N > 0 and this is review round N (or later; rounds are counted by a monotonic counter carried in the REVIEW_MEMORY marker, so any N works — the visible history table only keeps the last 10), a "changes" verdict whose findings are ALL below blocker severity is downgraded to "approved" — the findings stay listed as advisory, the comment carries an explicit "Round cap" callout, and FAIL_ON stops failing the job. A single blocker finding disables the cap for that round, counting every finding in a cluster, not just its representative. Requires REVIEW_MEMORY. 0 (default) = never surrender.'
     required: false
     default: '0'
   VERBOSITY:
@@ -136,6 +149,10 @@ inputs:
     description: 'Comma-separated verdicts that FAIL the job (turning this check red so branch protection can block the PR): changes, error, or both. Defaults to "changes" — the job goes red when the bot requests changes. Set "none" to keep the job green on every verdict (advisory only), or "changes,error" to also block when the review could not run. The comment, label, and outputs are posted regardless; only the exit code changes. This governs the verdict-driven gate only; a thrown infra error still fails the job regardless of FAIL_ON. Mark this check Required in branch protection for the red to block.'
     required: false
     default: 'changes'
+  APPROVE_BELOW:
+    description: 'The lowest finding severity that still withholds the merge-approved label: blocker, high, medium, low, or nit (aliases like "critical" normalize the same way finding severities do). Findings strictly below this level no longer block the label — they still post inline, in the summary, and in the verdict text, only the label rule changes. Defaults to "nit", the lowest severity, which preserves the pre-existing behavior where any finding withholds merge-approved. This is independent of FAIL_ON: FAIL_ON governs the job exit code from the verdict; APPROVE_BELOW governs only the merge-approved/request-changes label. An incomplete or partial review still yields request-changes regardless of this setting.'
+    required: false
+    default: 'nit'
   RUN_SECRET_SCAN:
     description: 'Run the deterministic secret scan (gitleaks) before the LLM review. Its findings feed the LLM as triage context and upload to the Code Scanning tab. Set false to skip.'
     required: false
@@ -145,7 +162,7 @@ inputs:
     required: false
     default: 'true'
   SAST_RULES:
-    description: 'Opengrep rule config(s) for the SAST pass (comma-separated). Default: p/typescript.'
+    description: 'Opengrep rule config(s) for the SAST pass (comma-separated). Default: p/typescript. Multi-language repos should broaden this (e.g. "p/javascript,p/typescript" or "p/default") — the default covers TypeScript only.'
     required: false
     default: 'p/typescript'
   TOOLU_API_KEY:
@@ -175,7 +192,11 @@ runs:
     # and uploads to the Code Scanning tab. Every scanner step is best-effort
     # (continue-on-error / `|| true`): a scanner or install failure degrades to an
     # LLM-only review — it must never break the consumer's PR. ---
+    # A `pull_request_review_comment` run is the no-model SETTLE pass (a reply on a bot
+    # thread recomputes the verdict from stored findings) — it reviews no code, so every
+    # scanner / SARIF step below is skipped on that event.
     - name: Install scanners (pinned release binaries)
+      if: ${{ github.event_name != 'pull_request_review_comment' }}
       shell: bash
       continue-on-error: true
       run: |
@@ -194,7 +215,7 @@ runs:
           || echo "::warning::opengrep install failed — SAST will be skipped"
         echo "$RUNNER_TEMP/toolu-bin" >> "$GITHUB_PATH"
     - name: Secret scan (gitleaks → SARIF)
-      if: ${{ inputs.RUN_SECRET_SCAN == 'true' }}
+      if: ${{ inputs.RUN_SECRET_SCAN == 'true' && github.event_name != 'pull_request_review_comment' }}
       shell: bash
       run: |
         # --no-git: scan the checked-out tree, NOT the full history (which re-flags
@@ -206,7 +227,7 @@ runs:
                --report-path "$RUNNER_TEMP/gitleaks.sarif" --exit-code 0 \
           || true
     - name: SAST (opengrep → SARIF)
-      if: ${{ inputs.RUN_SAST == 'true' }}
+      if: ${{ inputs.RUN_SAST == 'true' && github.event_name != 'pull_request_review_comment' }}
       shell: bash
       run: |
         # Exclude build output / deps in the CONSUMER's checkout — generated, not
@@ -231,14 +252,14 @@ runs:
     # directory to the mirror root, so mirror-action.sh rewrites `$/code-review/`
     # to `$/` when publishing.
     - name: Sanitize SARIF (clamp sub-1 regions)
-      if: ${{ always() }}
+      if: ${{ always() && github.event_name != 'pull_request_review_comment' }}
       continue-on-error: true   # best-effort like the scanners — never break the review
       uses: $/sanitize-sarif
       with:
         SRC_DIR: ${{ runner.temp }}
         DEST_DIR: ${{ runner.temp }}/toolu-sarif-upload
     - name: Upload SARIF to Code Scanning
-      if: ${{ always() }}
+      if: ${{ always() && github.event_name != 'pull_request_review_comment' }}
       continue-on-error: true   # fork PRs / missing `security-events: write` → skip; the review still runs
       uses: github/codeql-action/upload-sarif@v4
       with:
@@ -257,6 +278,10 @@ runs:
         # process.env.INPUT_* directly (@actions/core.getInput), so the composite
         # maps each of its inputs onto the step's env explicitly.
         INPUT_PROVIDER: ${{ inputs.PROVIDER }}
+        INPUT_BASE_URL: ${{ inputs.BASE_URL }}
+        INPUT_EXTRA_BODY: ${{ inputs.EXTRA_BODY }}
+        INPUT_JEV_ENABLED: ${{ inputs.JEV_ENABLED }}
+        INPUT_JEV_MODEL_ID: ${{ inputs.JEV_MODEL_ID }}
         INPUT_MODEL_ID: ${{ inputs.MODEL_ID }}
         INPUT_API_KEY: ${{ inputs.API_KEY }}
         INPUT_MAX_TOKENS: ${{ inputs.MAX_TOKENS }}
@@ -286,6 +311,7 @@ runs:
         INPUT_BOT_LOGO_URL: ${{ inputs.BOT_LOGO_URL }}
         INPUT_REVIEW_MEMORY: ${{ inputs.REVIEW_MEMORY }}
         INPUT_MAX_ROUNDS: ${{ inputs.MAX_ROUNDS }}
+        INPUT_APPROVE_BELOW: ${{ inputs.APPROVE_BELOW }}
         INPUT_FAIL_ON: ${{ inputs.FAIL_ON }}
         INPUT_VERBOSITY: ${{ inputs.VERBOSITY }}
         INPUT_TOOLU_API_KEY: ${{ inputs.TOOLU_API_KEY }}

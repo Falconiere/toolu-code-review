@@ -13,15 +13,23 @@
 //  - package assignment: the brief's `path_prefixes` beat path order when packing,
 //    and a null brief falls back to today's grouping exactly.
 import { describe, it, expect, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
 import { reviewAndValidate } from "@/pipeline/reviewCall.js";
 import { fetchDiff } from "@/git/diff.js";
 import type { DiffData } from "@/git/diff.js";
 import { splitDiffByFile } from "@/git/chunk.js";
+import { fingerprint } from "@/state.js";
+import { thread } from "@/review/__tests__/reconcile-helpers.js";
 import type { ActionInputs } from "@/inputs.js";
 import type { EventResolution } from "@/github/event.js";
 import type { BlockableVerdict } from "@/review/gate.js";
 import { git, setupGitRepo, writeFile, removeRepo } from "@/git/__tests__/helpers.js";
-import { contentFrames, sseResponse, wantsStream } from "@/__tests__/integration/sse.js";
+import {
+  contentFrames,
+  replayCompletion,
+  sseResponse,
+  wantsStream,
+} from "@/__tests__/integration/sse.js";
 
 /** One recorded outgoing model request. */
 interface CapturedCall {
@@ -132,6 +140,7 @@ function baseInputs(over: Partial<ActionInputs> = {}): ActionInputs {
     botLogoUrl: "https://example.com/logo.png",
     reviewMemory: true,
     failOn: new Set<BlockableVerdict>(),
+    approveBelow: "nit",
     verbosity: "compact",
     touluApiKey: "",
     touluApiUrl: "https://api.toolu.sh",
@@ -183,8 +192,33 @@ function diffOf(dir: string): DiffData {
 /** The `## Diff` fenced block of a captured envelope — the ONLY place a reviewer
  *  reads code; the changed-files list above it names every path either way. */
 function diffBlock(call: CapturedCall): string {
-  return call.user.slice(call.user.indexOf("\n\n## Diff\n"));
+  return call.user.split("## Diff\n```diff\n")[1]?.split("\n```\n")[0] ?? "";
 }
+
+it("supplies unchanged schema and test evidence to the package model request", async () => {
+  const dir = repoWith(
+    { "src/service.ts": "import { schema } from './schema';\nexport const value = schema;\n" },
+    {
+      "src/schema.ts": "export const schema = { approvedAt: 'default timestamp' };\n",
+      "src/__tests__/service.test.ts": "test('refresh preserves other installations', () => {});\n",
+    },
+  );
+  const calls: CapturedCall[] = [];
+  const server = modelServer(calls, VALID_BRIEF);
+  await reviewAndValidate({
+    inputs: baseInputs(),
+    diff: diffOf(dir),
+    event: EVENT,
+    priorThreads: [],
+    reviewHead: "HEAD",
+    cwd: dir,
+    fetch: server.fetch,
+  });
+  const request = calls.find((c) => !isCartographer(c));
+  expect(request?.user).toContain("default timestamp");
+  expect(request?.user).toContain("refresh preserves other installations");
+  expect(diffBlock(request!)).not.toContain("default timestamp");
+});
 
 describe("reviewAndValidate — Layer 0 (distill) runs before chunking", () => {
   it("collapses a pattern group to its exemplar in the reviewed diff and ledgers the members", async () => {
@@ -389,6 +423,28 @@ describe("reviewAndValidate — package assignment from the brief's hints", () =
 });
 
 describe("reviewAndValidate — wallDeadline pass-through (MAX_WALL_MS, s13)", () => {
+  it("rejects a historical no-quote response as fresh evidence without claiming clean coverage", async () => {
+    const dir = repoWith({
+      "src/util.ts": "export function add(a: number, b: number): number {\n  return a - b;\n}\n",
+    });
+    const body: unknown = JSON.parse(
+      readFileSync(new URL("../../llm/__tests__/fixtures/findings.json", import.meta.url), "utf8"),
+    );
+    const out = await reviewAndValidate({
+      inputs: baseInputs(),
+      diff: diffOf(dir),
+      event: EVENT,
+      priorThreads: [],
+      reviewHead: "HEAD",
+      cwd: dir,
+      fetch: async (_url, init) => replayCompletion(body, init),
+    });
+    expect(out.stamped).toEqual([]);
+    expect(out.result.verdict).toBe("error");
+    expect(out.result.error).toContain("source evidence");
+    expect(out.ledger.entries["src/util.ts"]?.status).toBe("unreviewed");
+  });
+
   it("reaches ChunkedReviewOptions: an already-past deadline skips every package call and ledgers pending", async () => {
     const dir = repoWith({ "src/a.ts": "export const a = 1;\n" });
     const calls: CapturedCall[] = [];
@@ -408,10 +464,435 @@ describe("reviewAndValidate — wallDeadline pass-through (MAX_WALL_MS, s13)", (
     });
 
     // The deadline is checked BEFORE every package, including the warm-up one —
-    // Layer 2 issues zero review calls (Layer 1's cartographer call is unaffected).
+    // Neither layer may spend a request once the shared deadline has expired.
     const review = calls.filter((c) => !isCartographer(c));
     expect(review.length).toBe(0);
+    expect(calls).toHaveLength(0);
     expect(out.ledger.entries["src/a.ts"]?.status).toBe("pending");
     expect(out.result.verdict).toBe("error");
   });
+
+  it("marks a salvaged recorded review unreviewed so resume includes its files", async () => {
+    const dir = repoWith({
+      "src/auth.ts": "export const authorized = false;\n",
+      "src/db.ts": "export const query = 'select 1';\n",
+    });
+    const body: unknown = JSON.parse(
+      readFileSync(
+        new URL("../../llm/__tests__/fixtures/truncated-findings.json", import.meta.url),
+        "utf8",
+      ),
+    );
+    const out = await reviewAndValidate({
+      inputs: baseInputs({ maxTokens: 131072 }),
+      diff: diffOf(dir),
+      event: EVENT,
+      priorThreads: [],
+      reviewHead: "HEAD",
+      cwd: dir,
+      fetch: async (_url, init) => replayCompletion(body, init),
+    });
+    expect(out.result.partial).toBe(true);
+    expect(out.ledger.entries["src/auth.ts"]?.status).toBe("unreviewed");
+    expect(out.ledger.entries["src/db.ts"]?.status).toBe("unreviewed");
+  });
+});
+
+describe("reviewAndValidate — the source-evidence gate's coverage consequence", () => {
+  /** A model server that answers every package call with `findings`. */
+  function serverWith(findings: unknown[]): typeof fetch {
+    return async (_url, init) => {
+      const body: RequestBody = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
+      const messages = body.messages ?? [];
+      const call: CapturedCall = {
+        system: messages.find((m) => m.role === "system")?.content ?? "",
+        user: messages.find((m) => m.role === "user")?.content ?? "",
+      };
+      if (isCartographer(call)) return chatResponse(VALID_BRIEF, init);
+      return chatResponse(
+        {
+          review_plan: "Reviewed the package.",
+          verdict: "changes",
+          findings,
+          other_checks: "",
+          top_must_fix: [],
+        },
+        init,
+      );
+    };
+  }
+
+  const BASE = { "src/util.ts": "export const keep = 0;\n" };
+  const FEATURE = {
+    "src/util.ts": "export const keep = 0;\nexport const a = 1;\nexport const b = 2;\n",
+  };
+
+  it("does not mark a file unreviewed for a misquoted claim that was already dismissed", async () => {
+    const dir = repoWith(FEATURE, BASE);
+    const finding = {
+      path: "src/util.ts",
+      line: 3,
+      quoted_line: "stale source",
+      severity: "high" as const,
+      confidence: "high",
+      text: "This export is a barrel.",
+    };
+    const out = await reviewAndValidate({
+      inputs: baseInputs(),
+      diff: diffOf(dir),
+      event: EVENT,
+      priorThreads: [
+        thread({
+          path: finding.path,
+          line: finding.line,
+          fp: fingerprint(finding),
+          isResolved: true,
+        }),
+      ],
+      reviewHead: "HEAD",
+      cwd: dir,
+      fetch: serverWith([finding]),
+    });
+    expect(out.stamped).toEqual([]);
+    expect(out.ledger.entries["src/util.ts"]?.status).toBe("reviewed");
+    expect(out.result.partial).not.toBe(true);
+    expect(out.settledBeforeValidation).toBe(1);
+  });
+
+  it("settles all members of a dismissed pattern before quote validation", async () => {
+    const paths = ["src/a.ts", "src/b.ts", "src/c.ts"];
+    const dir = repoWith(
+      Object.fromEntries(paths.map((path, i) => [path, `export const value${i} = ${i};\n`])),
+    );
+    const findings = paths.map((path) => ({
+      path,
+      line: 1,
+      quoted_line: "stale source",
+      severity: "high",
+      confidence: "high",
+      text: "This export is a barrel.",
+    }));
+    const first = findings[0]!;
+    const out = await reviewAndValidate({
+      inputs: baseInputs(),
+      diff: diffOf(dir),
+      event: EVENT,
+      priorThreads: [
+        thread({ path: first.path, line: 1, fp: fingerprint(first), isResolved: true }),
+      ],
+      reviewHead: "HEAD",
+      cwd: dir,
+      fetch: serverWith(findings),
+    });
+    expect(out.settledBeforeValidation).toBe(3);
+    expect(out.stamped).toEqual([]);
+    expect(Object.values(out.ledger.entries).every((entry) => entry.status === "reviewed")).toBe(
+      true,
+    );
+  });
+
+  it("keeps a path reviewed when one of its findings is mis-quoted but another survives", async () => {
+    const dir = repoWith(FEATURE, BASE);
+    const out = await reviewAndValidate({
+      inputs: baseInputs(),
+      diff: diffOf(dir),
+      event: EVENT,
+      priorThreads: [],
+      reviewHead: "HEAD",
+      cwd: dir,
+      fetch: serverWith([
+        {
+          path: "src/util.ts",
+          line: 2,
+          quoted_line: "export const a = 1;",
+          severity: "high",
+          confidence: "high",
+          text: "Unnamed constant.",
+        },
+        {
+          path: "src/util.ts",
+          line: 3,
+          quoted_line: "export const NOPE = 99;",
+          severity: "high",
+          confidence: "high",
+          text: "Quote is not the cited line.",
+        },
+      ]),
+    });
+    // The mis-quoted finding is still dropped — only the file's COVERAGE is spared.
+    expect(out.stamped).toHaveLength(1);
+    expect(out.stamped[0]?.line).toBe(2);
+    expect(out.ledger.entries["src/util.ts"]?.status).toBe("reviewed");
+    // No file is unreviewed, so the "affected files remain unreviewed" note must not fire.
+    expect(out.result.partial).not.toBe(true);
+    expect(out.result.error ?? "").not.toContain("lacked valid source evidence");
+  });
+
+  it("keeps a path reviewed when its only finding is mis-quoted (toolu-ghrunner PR #210)", async () => {
+    const dir = repoWith(FEATURE, BASE);
+    const out = await reviewAndValidate({
+      inputs: baseInputs(),
+      diff: diffOf(dir),
+      event: EVENT,
+      priorThreads: [],
+      reviewHead: "HEAD",
+      cwd: dir,
+      fetch: serverWith([
+        {
+          path: "src/util.ts",
+          line: 3,
+          quoted_line: "export const NOPE = 99;",
+          severity: "high",
+          confidence: "high",
+          text: "Quote is not the cited line.",
+        },
+      ]),
+    });
+    // The model read the file and answered; one misread line is a dropped finding,
+    // not an unreviewed file and not an error verdict.
+    expect(out.stamped).toHaveLength(0);
+    expect(out.ledger.entries["src/util.ts"]?.status).toBe("reviewed");
+    expect(out.result.verdict).not.toBe("error");
+    expect(out.result.partial).not.toBe(true);
+    expect(out.result.error ?? "").not.toContain("lacked valid source evidence");
+    expect(out.result.unverifiedEvidence).toBe(1);
+  });
+});
+
+describe("Jev after the baseline", () => {
+  it.each([false, true])(
+    "preserves baseline evidence and coverage with Jev enabled=%s",
+    async (enabled) => {
+      const dir = repoWith({
+        "src/util.ts": "export function add(a: number, b: number) {\n  return a - b;\n}\n",
+      });
+      const fixture: { response: { answers: Record<string, unknown> } } = JSON.parse(
+        readFileSync(
+          new URL("../../jev/__tests__/fixtures/supported.json", import.meta.url),
+          "utf8",
+        ),
+      );
+      const calls: string[] = [];
+      const fetchImpl: typeof fetch = async (url, init) => {
+        if ((url instanceof Request ? url.url : url.toString()).endsWith("/systemone")) {
+          calls.push("jev");
+          const body: { state: string; questions: Record<string, unknown> } = JSON.parse(
+            typeof init?.body === "string" ? init.body : "{}",
+          );
+          expect(body.state).toContain("return a - b;");
+          const answers = Object.fromEntries(
+            Object.keys(body.questions).map((id) => [
+              id,
+              fixture.response.answers[id === "risk" ? "risk" : "finding"],
+            ]),
+          );
+          return new Response(JSON.stringify({ ...fixture.response, answers }));
+        }
+        const body: RequestBody = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
+        if (body.messages?.some((m) => m.content.includes("You are the cartographer"))) {
+          calls.push("map");
+          return chatResponse(null, init);
+        }
+        calls.push("baseline");
+        const recorded: { choices: { message: { content: string } }[] } = JSON.parse(
+          readFileSync(
+            new URL("../../llm/__tests__/fixtures/findings.json", import.meta.url),
+            "utf8",
+          ),
+        );
+        const verdict: { findings: { quoted_line?: string }[] } = JSON.parse(
+          recorded.choices[0]?.message.content ?? "{}",
+        );
+        // Exact quote supplied by this scenario, as required by the evidence gate.
+        if (verdict.findings[0]) verdict.findings[0].quoted_line = "  return a - b;";
+        return chatResponse(verdict, init);
+      };
+      const out = await reviewAndValidate({
+        inputs: baseInputs({ jevEnabled: enabled }),
+        diff: diffOf(dir),
+        event: EVENT,
+        priorThreads: [],
+        reviewHead: "HEAD",
+        cwd: dir,
+        fetch: fetchImpl,
+      });
+      expect(out.stamped).toHaveLength(1);
+      expect(out.ledger.entries["src/util.ts"]?.status).toBe("reviewed");
+      expect(calls).toEqual(enabled ? ["map", "baseline", "jev"] : ["map", "baseline"]);
+      if (enabled) expect(out.result.enhancement?.assessed).toBe(2);
+    },
+  );
+  it("skips Jev when baseline source validation leaves incomplete coverage", async () => {
+    const dir = repoWith({ "src/util.ts": "export const util = 1;\n" });
+    let jevCalls = 0;
+    const fetchImpl: typeof fetch = async (url, init) => {
+      if ((url instanceof Request ? url.url : url.toString()).endsWith("/systemone")) {
+        jevCalls++;
+        throw new Error("must not dispatch");
+      }
+      return replayCompletion(
+        readFileSync(
+          new URL("../../llm/__tests__/fixtures/findings.json", import.meta.url),
+          "utf8",
+        ),
+        init,
+      );
+    };
+    const out = await reviewAndValidate({
+      inputs: baseInputs({ jevEnabled: true }),
+      diff: diffOf(dir),
+      event: EVENT,
+      priorThreads: [],
+      reviewHead: "HEAD",
+      cwd: dir,
+      fetch: fetchImpl,
+    });
+    expect(jevCalls).toBe(0);
+    expect(out.result.enhancement?.skipped).toBeGreaterThan(0);
+    expect(out.ledger.entries["src/util.ts"]?.status).toBe("unreviewed");
+  });
+});
+
+it("dismisses the recorded PR175 false positive only after the independent generative recheck", async () => {
+  const jev: {
+    request: {
+      state: {
+        source: { path: string; content: string };
+        finding: { path: string; line: number; text: string; severity: string; confidence: string };
+      };
+    };
+    response: { answers: Record<string, unknown> };
+  } = JSON.parse(
+    readFileSync(
+      new URL("../../jev/__tests__/fixtures/full-counterexample.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const recheck: { response: { choices: { message: { content: string } }[] } } = JSON.parse(
+    readFileSync(
+      new URL("../../jev/__tests__/fixtures/generative-recheck-exact-id.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const source = jev.request.state.source;
+  const finding = {
+    ...jev.request.state.finding,
+    quoted_line: "            onChange={(event) => {",
+  };
+  const dir = repoWith({ [source.path]: source.content });
+  const order: string[] = [];
+  const fetchImpl: typeof fetch = async (url, init) => {
+    const bodyText = typeof init?.body === "string" ? init.body : "{}";
+    if ((url instanceof Request ? url.url : url.toString()).endsWith("/systemone")) {
+      order.push("jev");
+      const body: { questions: Record<string, unknown> } = JSON.parse(bodyText);
+      return new Response(
+        JSON.stringify({
+          ...jev.response,
+          answers: Object.fromEntries(
+            Object.keys(body.questions).map((id) => [
+              id,
+              jev.response.answers[id === "risk" ? "risk" : "finding"],
+            ]),
+          ),
+        }),
+      );
+    }
+    const body: RequestBody = JSON.parse(bodyText);
+    const system = body.messages?.find((m) => m.role === "system")?.content ?? "";
+    if (system.includes("You are the cartographer")) {
+      order.push("map");
+      return chatResponse(VALID_BRIEF, init);
+    }
+    if (system.includes("Recheck the supplied")) {
+      order.push("recheck");
+      const verdict: { decisions: { id: string }[] } = JSON.parse(
+        recheck.response.choices[0]?.message.content ?? "{}",
+      );
+      for (const decision of verdict.decisions) decision.id = fingerprint(finding);
+      return chatResponse(verdict, init);
+    }
+    order.push("baseline");
+    return chatResponse(
+      {
+        review_plan: "Review the prefix state transitions.",
+        verdict: "changes",
+        findings: [finding],
+        other_checks: "",
+        top_must_fix: [],
+      },
+      init,
+    );
+  };
+  const out = await reviewAndValidate({
+    inputs: baseInputs({ jevEnabled: true }),
+    diff: diffOf(dir),
+    event: EVENT,
+    priorThreads: [],
+    reviewHead: "HEAD",
+    cwd: dir,
+    fetch: fetchImpl,
+  });
+  expect(order).toEqual(["map", "baseline", "jev", "recheck"]);
+  expect(out.result.enhancement?.dismissed).toBe(1);
+  expect(out.stamped).toEqual([]);
+  expect(out.ledger.entries[source.path]?.status).toBe("reviewed");
+});
+
+it("a validated additional defect cannot retain a contradictory approved verdict", async () => {
+  const dir = repoWith({
+    "src/util.ts": "export function add(a: number, b: number) {\n  return a - b;\n}\n",
+  });
+  const calls: CapturedCall[] = [];
+  const baseline = modelServer(calls, VALID_BRIEF);
+  let additional = 0;
+  const fetchImpl: typeof fetch = async (url, init) => {
+    if ((url instanceof Request ? url.url : url.toString()).endsWith("/systemone")) {
+      const fixture: { response: { answers: Record<string, unknown> } } = JSON.parse(
+        readFileSync(
+          new URL("../../jev/__tests__/fixtures/cross-file-risk.json", import.meta.url),
+          "utf8",
+        ),
+      );
+      // Explicit routing-boundary variation, not a purported live judgment.
+      // Real source and the recorded generative finding remain unchanged.
+      fixture.response.answers.risk = {
+        type: "choice",
+        choice: "high",
+        confidence: 1,
+        probabilities: { high: 1, ordinary: 0, insufficient_evidence: 0 },
+      };
+      return new Response(JSON.stringify(fixture.response));
+    }
+    const body: RequestBody = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
+    if (body.messages?.some((m) => m.content.includes("Additional review:"))) {
+      additional++;
+      const recorded: { choices: { message: { content: string } }[] } = JSON.parse(
+        readFileSync(
+          new URL("../../llm/__tests__/fixtures/findings.json", import.meta.url),
+          "utf8",
+        ),
+      );
+      const verdict: { verdict: string; findings: { quoted_line?: string }[] } = JSON.parse(
+        recorded.choices[0]?.message.content ?? "{}",
+      );
+      verdict.verdict = "approved"; // Deliberately inconsistent, schema-valid response.
+      if (verdict.findings[0]) verdict.findings[0].quoted_line = "  return a - b;";
+      return chatResponse(verdict, init);
+    }
+    return baseline.fetch(url, init);
+  };
+  const out = await reviewAndValidate({
+    inputs: baseInputs({ jevEnabled: true }),
+    diff: diffOf(dir),
+    event: EVENT,
+    priorThreads: [],
+    reviewHead: "HEAD",
+    cwd: dir,
+    fetch: fetchImpl,
+  });
+  expect(additional).toBe(1);
+  expect(out.stamped).toHaveLength(1);
+  expect(out.result.verdict).toBe("changes");
+  expect(out.result.enhancement?.additionalReviews).toBe(1);
 });

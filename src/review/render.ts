@@ -5,20 +5,20 @@
 import type { Finding } from "@/llm/schema.js";
 import type { MechanicalFinding } from "@/mechanical/sarif.js";
 import type { FindingCluster } from "@/review/cluster.js";
+import { SEVERITY_RANK } from "./findings.js";
 import {
   buildClusterSection,
   buildDroppedSection,
   buildUnanchoredSection,
 } from "@/review/sections.js";
 
-/** Severity rank, blocker (worst) → nit (least). Used to order/shrink findings. */
-export const SEVERITY_RANK: Record<Finding["severity"], number> = {
-  blocker: 0,
-  high: 1,
-  medium: 2,
-  low: 3,
-  nit: 4,
-};
+// The findings list itself lives in review/findings.ts (this file is at its size
+// budget); re-exported here so verdict.ts keeps one import site for the body.
+export {
+  buildFindingsSection,
+  buildTruncatedFindingsSection,
+  SEVERITY_RANK,
+} from "@/review/findings.js";
 
 /** Cap on the rendered top-must-fix list, matching coordinate-findings.sh `.[0:3]`. */
 const TOP_MUST_FIX_MAX = 3;
@@ -27,15 +27,20 @@ const TOP_MUST_FIX_MAX = 3;
 export interface ReviewBody {
   /** Resolved verdict label markdown, e.g. "`merge-approved`". */
   verdictLabel: string;
+  /** Deterministic optional-enhancement counts. */
+  enhancementNote?: string;
   /** Verdict badge text, e.g. "✅ Approved". */
   verdictBadge: string;
   /** Provider error detail shown under the verdict when the review errored ("" → omit). */
   errorDetail: string;
   /**
-   * True ONLY when the resolved verdict is "error" (the LLM abstained — no judgment).
-   * NOT derivable from errorDetail: a recovered truncation / partly-failed chunked
-   * review sets errorDetail while still delivering findings and a real verdict, and
-   * rendering "LLM judgment unavailable" over a findings list is a lie.
+   * True ONLY when the LLM abstained — it delivered no review plan, no other-checks
+   * blurb and no findings. NOT derivable from errorDetail: a recovered truncation /
+   * partly-failed chunked review sets errorDetail while still delivering findings and a
+   * real verdict. NOT derivable from the resolved verdict alone either: the
+   * source-evidence gate and the coverage degrade force verdict "error" on a review the
+   * provider answered in full. Rendering "LLM judgment unavailable" above the model's
+   * own review plan, or over a findings list, is a lie either way.
    */
   llmErrored: boolean;
   /** The header line ("**AI Code Review finished …** —— [View job](url)"). */
@@ -52,8 +57,6 @@ export interface ReviewBody {
   reviewPlan: string;
   /** The model's other-checks blurb ("" → section omitted). */
   otherChecks: string;
-  /** The model's explicit top-must-fix list (empty → section omitted, never auto-generated). */
-  topMustFix: string[];
   /** All findings (after validation). */
   findings: Finding[];
   /** File count of the reviewed diff — shown in the compact checklist line. */
@@ -74,6 +77,9 @@ export interface ReviewBody {
   mechanical: MechanicalFinding[];
   /** MAX_ROUNDS surrender note shown under the verdict line ("" → omit). */
   capNote: string;
+  /** Count of findings the source-evidence gate dropped as unverifiable, worded for
+   *  the reader ("" → omit). Informational: those drops never block the verdict. */
+  evidenceNote: string;
   /** Pre-rendered coverage-ledger section (review/ledger.ts). Unlike recap/history
    *  it IS droppable: it joins the size ladder ahead of findings (verdict.ts). */
   ledger: string;
@@ -111,6 +117,8 @@ export function renderBody(body: ReviewBody, findingsSection: string): string {
   // The MAX_ROUNDS surrender is a verdict override — say so right under the verdict
   // so an auto-approved round is never mistaken for a clean review.
   if (body.capNote !== "") main += `\n\n> 🔁 **Round cap:** ${body.capNote}`;
+  if (body.evidenceNote !== "") main += `\n\n> ℹ️ **Unverified findings:** ${body.evidenceNote}`;
+  if (body.enhancementNote) main += `\n\n${body.enhancementNote}`;
   parts.push(main);
 
   if (body.recap !== "") parts.push(`\n${body.recap}\n`);
@@ -135,9 +143,10 @@ export function renderBody(body: ReviewBody, findingsSection: string): string {
   // Per-file coverage: what was reviewed, carried, excluded, or NOT reviewed.
   if (body.ledger !== "") section += `${body.ledger}\n`;
   if (body.otherChecks !== "") section += `### Other checks\n${body.otherChecks}\n\n`;
-  // Top-N renders ONLY from the model's explicit list — it is no longer auto-generated
-  // from findings (that was a verbatim duplicate of the severity-sorted Findings list).
-  const topMustFix = buildTopMustFixSection(body.topMustFix);
+  // Top-N is derived from the same surviving findings the comment renders. Never
+  // render independently generated model prose here: it may describe a claim the
+  // evidence gate, scope filter, or settlement step already rejected.
+  const topMustFix = buildTopMustFixSection(body.findings);
   if (topMustFix !== "") section += `### Top-N must-fix\n${topMustFix}`;
   parts.push(section);
 
@@ -172,52 +181,6 @@ function buildChecklist(body: ReviewBody): string {
 }
 
 /**
- * The findings list — one line per finding, `path:line`: severity: text plus an
- * optional italic "(category · confidence)" suffix. "_No findings._" when empty.
- * Sorted worst-severity-first so the top of the list IS the must-fix view (the
- * auto-generated Top-N was dropped as a duplicate of this).
- */
-export function buildFindingsSection(findings: Finding[]): string {
-  if (findings.length === 0) return "_No findings._";
-  // Sort a COPY: `findings` is the SAME array the pipeline later maps for reconcile and
-  // inline posting, so an in-place sort would reorder those; the sort is stable, so
-  // equal-severity findings keep their input order.
-  const ordered = [...findings].sort(
-    (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
-  );
-  return ordered.map(findingLine).join("\n");
-}
-
-/**
- * Findings shrunk to the highest-severity `keep`, with a trailing
- * "_… N more findings — see the [job log](url)_" note. Used by the size guard.
- */
-export function buildTruncatedFindingsSection(
-  findings: Finding[],
-  keep: number,
-  jobUrl: string,
-): string {
-  const ordered = [...findings].sort(
-    (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
-  );
-  const shown = ordered.slice(0, keep);
-  const lines = shown.map(findingLine);
-  const extra = findings.length - keep;
-  if (extra > 0) lines.push(`_… ${extra} more findings — see the [job log](${jobUrl})_`);
-  return lines.join("\n");
-}
-
-/** One finding line: ``path:line`` [source]: severity: text (category · confidence). */
-function findingLine(f: Finding): string {
-  const loc = f.line !== undefined && f.line !== null ? `:${f.line}` : "";
-  // Provenance tag for findings the model confirmed from a deterministic tool.
-  const src = f.source !== undefined && f.source !== "llm" ? ` _[${f.source}]_` : "";
-  const meta = [f.category, f.confidence].filter((x): x is string => x !== undefined && x !== "");
-  const suffix = meta.length > 0 ? ` _(${meta.join(" · ")})_` : "";
-  return `\`${f.path}${loc}\`${src}: ${f.severity}: ${f.text}${suffix}`;
-}
-
-/**
  * The "### Mechanical checks" section — a per-tool count of the deterministic
  * findings (uploaded to the Code Scanning tab), plus, when the LLM errored, a
  * "judgment unavailable" note so a provider failure still yields a useful review
@@ -244,28 +207,15 @@ export function buildMechanicalSection(
 }
 
 /**
- * The Top-N must-fix section body — the model's EXPLICIT `top_must_fix` only, deduped
- * and capped at 3. Insertion order is kept: the model lists these worst-first, so
- * priority must survive the dedupe. Returns "" when the model gave no explicit list —
- * the caller then omits the heading. It is NEVER auto-generated from findings: that
- * produced a verbatim duplicate of the (now severity-sorted) Findings list.
+ * The Top-N must-fix section body — derived from the surviving findings, sorted by
+ * severity and capped at three. This summary cannot resurrect an unvalidated claim.
  */
-function buildTopMustFixSection(topMustFix: string[]): string {
-  const capped = dedupeCap(topMustFix, TOP_MUST_FIX_MAX);
-  return capped.length > 0 ? capped.join("\n") : "";
-}
-
-/** Dedupe a string list keeping first occurrence (insertion order), then cap to `max`. */
-function dedupeCap(items: string[], max: number): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of items) {
-    if (seen.has(item)) continue;
-    seen.add(item);
-    out.push(item);
-    if (out.length === max) break;
-  }
-  return out;
+function buildTopMustFixSection(findings: Finding[]): string {
+  return [...findings]
+    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity])
+    .slice(0, TOP_MUST_FIX_MAX)
+    .map((finding) => `- \`${finding.path}:${finding.line}\` — ${finding.text}`)
+    .join("\n");
 }
 
 /**

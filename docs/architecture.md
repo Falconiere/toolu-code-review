@@ -95,14 +95,29 @@ header for the full story, this is just the index).
 - **`reconcile.ts`** — decides `toCreate`/`toReply`/`toResolve` for the bot's
   prior inline threads against this round's findings (cluster
   representatives only — see `pipeline/reduce.ts`); cluster-aware coverage
-  (any member fp matching a thread covers the whole cluster).
+  (a matching open thread covers the whole cluster; a resolved thread covers it
+  only when its settlement applies to the surviving findings).
 - **`render.ts`** — assembles the verdict-comment markdown body from a
   `ReviewBody` (findings, ledger, unanchored findings, cluster sections).
+- **`findings.ts`** — the `### Findings` layout (and `SEVERITY_RANK`, the
+  worst-first order every consumer sorts by): one `#### <severity>` group per
+  severity present, one numbered block per finding (location line, `<sub>` meta
+  line, text paragraph), plus the size-guard's truncated variant. The block shape
+  is a contract — `scripts/parse-verdict.sh` reads it back into JSON.
 - **`sections.ts`** — renders the three size-capped sticky-comment sections
   split out of `render.ts`: `### Unanchored findings` (no anchor exists),
   `### Findings GitHub rejected inline` (422'd even isolated alone — the
   `InlineReviewResult.dropped` path), each ≤20 rows, and `### Repeated
   findings` (≤10 clusters, ≤10 members listed each).
+- **`recompute.ts`** — `recomputeVerdict()`, the no-model settle decision:
+  the last completed round's stored findings minus the ones settled on their
+  threads (`dropSettled`, cluster-aware), labelled by `resolveLabelVerdict`.
+  Fails closed on no state, an incomplete round, a stale head, or a last
+  verdict other than `changes`. Shared with merge-gate's recompute (#123) via
+  `pipeline/settleEvaluation.ts`.
+- **`settledBody.ts`** — patches the sticky's verdict line, `Settled` note
+  and label line after a settle pass; the marker is never touched, and an
+  unrecognised body yields `null` (write nothing).
 - **`verdict.ts`** — verdict→label/badge mapping (`formatVerdict`) and the
   `fitToSizeLimit` shrink ladder: ledger exception rows → whole ledger
   section → findings (worst-severity-last), all ahead of ever dropping the
@@ -134,11 +149,28 @@ header for the full story, this is just the index).
   `mapPr()` → `reviewChunked()` in that fixed order, validates + fingerprint
   stamps findings against the shrunk diff, and assembles this round's
   `CoverageLedger`.
+- **`settleEvaluation.ts`** — `evaluateSettle()`, the read-only half of the
+  settle recompute: trusts only a Bot-authored, not-in-progress sticky and
+  that bot's own threads, checks the LIVE head, classifies dismissals, then
+  runs `recompute.ts`. Shared by `dismissRecompute.ts` and merge-gate's
+  recompute (`src/gate/`), so both agree on what "settled" means.
+- **`dismissRecompute.ts`** — the settle pass a reply on a bot thread runs
+  (`pull_request_review_comment`): `evaluateSettle()`, then flips
+  `request-changes` → `merge-approved` via `settledBody.ts` + the label —
+  no git, no model, no thread mutations.
 - **`publish.ts`** — the publish orchestration, order load-bearing twice
   over: inline threads run **before** the sticky comment (so unanchored and
   dropped findings can be rendered into it), and the toolu.sh report runs
   **after** the inline mutations (so it never claims a fix GitHub didn't
   accept).
+
+### `src/gate/`
+- **`settleCheck.ts` / `settleCheckCli.ts` / `settleCheckMain.ts`** —
+  merge-gate's read-only settle recompute (#123), bundled by `build.mjs` to
+  `../merge-gate/recompute/index.cjs` (a nested node24 action the merge-gate
+  composite runs before its bash gate). `evaluateSettle()` flattened into
+  step outputs (`outcome`, `reason`, `verdict`, `settled`, `total`); no model
+  call, no GitHub writes, and every failure is `outcome=unchanged`.
 
 ### `src/github/`
 - **`review.ts`** — `postInlineReview()`: builds inline comments, validates
@@ -149,13 +181,14 @@ header for the full story, this is just the index).
 - **`reviewBatch.ts`** — batches comments at `MAX_COMMENTS_PER_REVIEW=30`;
   a batch that 422s is bisected (poison-comment isolation) so the rest of
   the batch still posts; the isolated comment is returned in `dropped`.
-- **`event.ts`** — normalizes a `pull_request` or `issue_comment` event into
-  one `EventResolution`, including the `<TRIGGER_PHRASE> review` vs
-  `<TRIGGER_PHRASE> resume` parse (same fail-closed permission gate for
-  both).
+- **`event.ts`** — normalizes a `pull_request`, `issue_comment` or
+  `pull_request_review_comment` event into one `EventResolution`, including
+  the `<TRIGGER_PHRASE> review` vs `<TRIGGER_PHRASE> resume` parse (same
+  fail-closed permission gate for both). A review-comment reply resolves to
+  `settle` (`reviewCommentEvent.ts`) — the no-model settle pass.
 
 ### `src/llm/`
-- **`reviewWithModel.ts`** — the provider-agnostic `generateObject` call
+- **`reviewWithModel.ts`** — the OpenRouter `generateObject` call
   (timeout/abort, retries, budget escalation, salvage, abstain). A failed
   call's error result carries `failure: "schema" | "transport" | "timeout"`
   so callers can tell a bisectable failure from one that isn't.
@@ -186,7 +219,7 @@ header for the full story, this is just the index).
 |---|---|---|---|
 | Schema failure (model can't emit structured output for an envelope) | `review/bisect.ts` (`reviewPackage`) | Bisects the package (`BISECT_MAX_DEPTH=2`, ≤4 leaves, ≤7 calls total) instead of one flat retry — the split *is* the retry | Surviving leaves ledgered `reviewed`; a leaf that still fails is ledgered `unreviewed` **per file**, never a whole-chunk write-off |
 | Transport / timeout failure | `review/bisect.ts` (never bisects for these causes) | One classic retry (today's pre-v7 behavior); splitting a struggling/rate-limited provider would only add load | Still failing after the retry → every file in the package ledgered `unreviewed` |
-| Wall clock exceeded (`MAX_WALL_MS`) | `review/bisect.ts`/`review/chunked.ts` (`deadlinePassed`, checked before every package **and** every bisection split) | Remaining packages/halves are skipped outright, zero calls spent | Ledgered `pending`; `reviewed_tree` does **not** advance; marker persists `pending_paths`/`unreviewed_paths`; resumable via `@toolu resume`, a workflow re-run, or the PR's next push |
+| Wall clock exceeded (`MAX_WALL_MS`, default ten minutes) | `llm/reviewWithModel.ts` bounds active attempts, retries, escalation and backoff; `review/bisect.ts`/`review/chunked.ts` guard dispatch | One absolute deadline also covers cartography. Active calls abort; completed findings are salvaged as partial. Unstarted packages/halves are skipped | Attempted partial files stay `unreviewed`, unstarted files stay `pending`; `reviewed_tree` does **not** advance. Both resume via `@toolu resume`, a workflow re-run, or the next push. Publishing is outside the deadline |
 | Unanchorable finding (file has no `patch` in `listFiles`, or its line maps onto nothing GitHub shows) | `github/review.ts` (`fetchAnchorableLines`/`validateAnchor`) | Never posted inline — there is no file-level fallback (GitHub's Reviews API 422s a review containing even one such comment) | Returned in `InlineReviewResult.unanchored`; rendered in the sticky comment's `### Unanchored findings` section |
 | Poison comment (a batch still 422s after anchor validation) | `github/reviewBatch.ts` (`postBatch`, recursive bisection) | Batch is bisected in half repeatedly until the poison comment is isolated alone; every sibling comment still posts | Isolated finding returned in `InlineReviewResult.dropped` (`pipeline/publish.ts`'s `postInline()` now threads it through) and rendered in the sticky comment's `### Findings GitHub rejected inline` section (`review/sections.ts`'s `buildDroppedSection`, placed right after `### Unanchored findings` in `render.ts`) — never silently lost |
 | Cartographer (Layer 1) failure — reject, timeout, or schema-invalid brief | `review/cartographer.ts` (`mapPr`, never throws) | Returns `null`; Layer 2 proceeds with `brief: null` (envelopes simply omit the brief block) | No ledger effect — this is a quality-of-context loss, not a coverage loss |

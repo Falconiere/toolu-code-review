@@ -55,6 +55,7 @@ function inputsWith(over: Partial<ActionInputs> = {}): ActionInputs {
     botLogoUrl: "https://example.com/logo.png",
     reviewMemory: false,
     failOn: new Set<BlockableVerdict>(),
+    approveBelow: "nit",
     verbosity: "compact",
     touluApiKey: "",
     touluApiUrl: "https://api.toolu.sh",
@@ -117,6 +118,36 @@ function history(n: number): HistoryEntry[] {
   }));
 }
 
+const CLUSTER_TEXT = "the same defect repeated in every module of this layer";
+const CLUSTER_PATHS = ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"];
+
+/** The path `pinExemplarFp` will pick — the lowest fingerprint, which has nothing
+ *  to do with severity, so it has to be computed rather than assumed. */
+function exemplarPath(): string {
+  const ranked = CLUSTER_PATHS.map((path) => ({
+    path,
+    fp: fingerprint({ path, category: "correctness", text: CLUSTER_TEXT }),
+  })).sort((x, y) => x.fp.localeCompare(y.fp));
+  const lowest = ranked[0]?.path;
+  if (lowest === undefined) throw new Error("fixture: no paths to rank");
+  return lowest;
+}
+
+/**
+ * Four findings sharing category+text across four paths — exactly ONE cluster. Every
+ * member is `low` except that, when `withBlocker` is set, one NON-exemplar member is
+ * a `blocker`. That is the shape the cluster key makes routine: severity is not part
+ * of the key, and the exemplar is chosen by lowest fingerprint.
+ */
+function clusteredFindings(withBlocker: boolean): StampedFinding[] {
+  const exemplar = exemplarPath();
+  const blockerPath = CLUSTER_PATHS.find((p) => p !== exemplar);
+  if (blockerPath === undefined) throw new Error("fixture: no non-exemplar path");
+  return CLUSTER_PATHS.map((path) =>
+    stamp(path, withBlocker && path === blockerPath ? "blocker" : "low", CLUSTER_TEXT),
+  );
+}
+
 /** A round ledger over `reviewed` ∪ `unreviewed` ∪ `carried` paths, built the real way. */
 function ledgerOf(reviewed: string[], unreviewed: string[], carried: string[] = []) {
   const paths = [...reviewed, ...unreviewed, ...carried];
@@ -150,6 +181,13 @@ function settle(opts: {
   priorFindings?: StoredFinding[];
   /** Count `validateFindings` dropped as self-negating (default 0). */
   selfNegating?: number;
+  /** Count the source-evidence gate dropped as unverifiable quotes (default none). */
+  unverifiedEvidence?: number;
+  jevDismissed?: number;
+  /** The marker's monotonic completed-round counter (state.ts `rounds`). Omit it to
+   *  build a marker written BEFORE that field existed, whose round count falls back
+   *  to the (display-capped) history length. */
+  rounds?: number;
 }) {
   const ledger = ledgerOf(opts.reviewed, opts.unreviewed, opts.carried ?? []);
   const prior: ReviewState = {
@@ -157,6 +195,7 @@ function settle(opts: {
     version: 1,
     findings: opts.priorFindings ?? [],
     history: history(opts.priorRounds),
+    ...(opts.rounds === undefined ? {} : { rounds: opts.rounds }),
   };
   const reduction = reduceFindings({ modelFindings: opts.findings, prior, ledger });
   const input: PublishInput = {
@@ -179,7 +218,24 @@ function settle(opts: {
       truncated: false,
       base_sha: "base123",
     },
-    result: { verdict: opts.resultVerdict ?? "changes", findings: opts.findings },
+    result: {
+      verdict: opts.resultVerdict ?? "changes",
+      findings: opts.findings,
+      ...(opts.unverifiedEvidence === undefined
+        ? {}
+        : { unverifiedEvidence: opts.unverifiedEvidence }),
+      enhancement: {
+        assessed: 1,
+        rechecked: 1,
+        dismissed: opts.jevDismissed ?? 0,
+        additionalReviews: 0,
+        unavailable: 0,
+        skipped: 0,
+        calls: 2,
+        elapsedMs: 1,
+        assessments: [],
+      },
+    },
     stamped: opts.findings,
     selfNegating: opts.selfNegating ?? 0,
     priorThreads: [],
@@ -200,6 +256,20 @@ function settle(opts: {
 }
 
 describe("settleVerdict — MAX_ROUNDS surrender vs the coverage degrade", () => {
+  it("reports an unsupported changes verdict as an error when there are no findings", () => {
+    const settled = settle({
+      findings: [],
+      reviewed: ["src/a.ts"],
+      unreviewed: [],
+      maxRounds: 0,
+      priorRounds: 0,
+    });
+
+    expect(settled.verdict).toBe("error");
+    expect(settled.validated.verdict).toBe("error");
+    expect(settled.validated.error).toContain("no source-validated actionable findings");
+  });
+
   it("the coverage degrade runs LAST and overrides the round cap's approval (decided order)", () => {
     // Round 3 of MAX_ROUNDS=3 with only sub-blocker findings → applyRoundCap turns
     // "changes" into "approved". One path went unreviewed in the same round, so the
@@ -313,9 +383,9 @@ describe("settleVerdict — the coverage degrade on its own", () => {
     expect(settled.capped).toBe(false);
   });
 
-  it("leaves a findings-free `changes` alone — the degrade only ever touches an approval", () => {
-    // Nothing was suppressed or dropped, so the flip-to-approved rule does not fire
-    // either; the verdict stays the do-not-merge one it already was.
+  it("classifies a findings-free `changes` as an unsupported verdict", () => {
+    // Nothing was suppressed or dropped, so there is no actionable evidence for
+    // the provider's change request and no reason to infer an approval either.
     const settled = settle({
       findings: [],
       reviewed: ["src/a.ts"],
@@ -323,8 +393,8 @@ describe("settleVerdict — the coverage degrade on its own", () => {
       maxRounds: 0,
       priorRounds: 0,
     });
-    expect(settled.verdict).toBe("changes");
-    expect(settled.validated.error).toBeUndefined();
+    expect(settled.verdict).toBe("error");
+    expect(settled.validated.error).toContain("no source-validated actionable findings");
   });
 
   it("a carried finding holds the prior round's `changes`, and validated.verdict agrees", () => {
@@ -440,5 +510,170 @@ describe("settleVerdict — the self-negation flip (AC-8)", () => {
 
     expect(settled.verdict).toBe("error");
     expect(settled.validated.error).toContain("1 file(s) were not reviewed this run");
+  });
+
+  it("a review whose every finding misquoted its source settles approved (toolu-ghrunner PR #210)", () => {
+    // The model asked for changes, but each finding's quote was not at its cited line,
+    // so the gate dropped them all. Like self-negating noise, that leaves nothing
+    // actionable: the verdict approves rather than reporting an unsupported request.
+    const settled = settle({
+      findings: [],
+      reviewed: ["AGENTS.md"],
+      unreviewed: [],
+      maxRounds: 0,
+      priorRounds: 0,
+      resultVerdict: "changes",
+      unverifiedEvidence: 2,
+    });
+
+    expect(settled.verdict).toBe("approved");
+    expect(settled.validated.error).toBeUndefined();
+    expect(settled.validated.unverifiedEvidence).toBe(2);
+  });
+});
+
+describe("Jev dismissal accounting", () => {
+  it("clears stale changes only after confirmed dismissal, preserving coverage degradation", () => {
+    const opts = {
+      findings: [],
+      reviewed: ["src/a.ts"],
+      unreviewed: [],
+      maxRounds: 0,
+      priorRounds: 0,
+      jevDismissed: 1,
+    };
+    expect(settle(opts).verdict).toBe("approved");
+    expect(settle({ ...opts, jevDismissed: 0 }).verdict).toBe("error");
+    expect(settle({ ...opts, unreviewed: ["src/b.ts"] }).verdict).toBe("error");
+  });
+});
+
+it("Jev dismissal accounting does not clear scanner or carried findings", () => {
+  const scanner = {
+    ...stamp("src/scan.ts", "high", "Scanner evidence remains."),
+    source: "opengrep" as const,
+  };
+  expect(
+    settle({
+      findings: [scanner],
+      reviewed: ["src/scan.ts"],
+      unreviewed: [],
+      maxRounds: 0,
+      priorRounds: 0,
+      jevDismissed: 1,
+    }).verdict,
+  ).toBe("changes");
+  const historical = stamp("src/carried.ts", "high", "Historical defect remains.");
+  const out = settle({
+    findings: [],
+    reviewed: ["src/new.ts"],
+    unreviewed: [],
+    carried: ["src/carried.ts"],
+    priorFindings: [historical],
+    maxRounds: 0,
+    priorRounds: 1,
+    resultVerdict: "changes",
+    jevDismissed: 1,
+  });
+  expect(out.findings.map((f) => f.fp)).toContain(historical.fp);
+  expect(out.verdict).toBe("changes");
+});
+
+// Severity is deliberately NOT part of the cluster key and `pinExemplarFp` picks the
+// LOWEST FINGERPRINT, so a cluster's representative is routinely less severe than one
+// of its own members. The round cap asks "is any remaining finding a blocker?" — fed
+// representatives only, it asked that of the exemplar and got "no" while a blocker
+// member stood right behind it, downgrading a live "changes" to "approved". settle.ts
+// now expands to full member lists before the gate, the way review/recompute.ts always
+// did before its own label gate, so the two paths agree.
+describe("settleVerdict — the round cap sees cluster MEMBERS, not just the exemplar", () => {
+  it("a blocker hiding behind a `low` exemplar still disables the cap", () => {
+    const findings = clusteredFindings(true);
+    const settled = settle({
+      findings,
+      reviewed: CLUSTER_PATHS,
+      unreviewed: [],
+      maxRounds: 3,
+      priorRounds: 2,
+    });
+
+    // The premise: the representative the comment lists really is the `low` one.
+    expect(settled.findings).toHaveLength(1);
+    expect(settled.findings[0]?.severity).toBe("low");
+    expect(settled.findings[0]?.path).toBe(exemplarPath());
+
+    expect(settled.capped).toBe(false);
+    expect(settled.verdict).toBe("changes");
+    expect(settled.validated.verdict).toBe("changes");
+    expect(settled.capNote).toBe("");
+  });
+
+  it("the same cluster with NO blocker member is still capped (the control)", () => {
+    // Identical shape, every member sub-blocker: the cap must keep firing, so the
+    // case above turns on the hidden blocker and not on clusters being exempt.
+    const settled = settle({
+      findings: clusteredFindings(false),
+      reviewed: CLUSTER_PATHS,
+      unreviewed: [],
+      maxRounds: 3,
+      priorRounds: 2,
+    });
+
+    expect(settled.findings).toHaveLength(1);
+    expect(settled.capped).toBe(true);
+    expect(settled.verdict).toBe("approved");
+    expect(settled.capNote).toContain("Round cap reached (MAX_ROUNDS=3)");
+  });
+});
+
+// `history` is display-capped to the last 10 entries (state.ts), so deriving the round
+// number from its length meant round 11 onward looked like round 10 forever: with
+// MAX_ROUNDS=12, `priorRounds + 1 < maxRounds` stayed true on every push and the cap
+// could never fire. state.ts now persists a monotonic `rounds` counter beside history
+// and settle.ts reads that.
+describe("settleVerdict — MAX_ROUNDS past the history display cap", () => {
+  it("fires at round 13 when the marker counted 12 rounds but history only shows 10", () => {
+    const settled = settle({
+      findings: [stamp("src/a.ts", "medium", "prefer a named constant here")],
+      reviewed: ["src/a.ts"],
+      unreviewed: [],
+      maxRounds: 12,
+      priorRounds: 10, // what the capped history array can show…
+      rounds: 12, // …and what the marker actually counted
+    });
+
+    expect(settled.capped).toBe(true);
+    expect(settled.verdict).toBe("approved");
+    expect(settled.validated.verdict).toBe("approved");
+    expect(settled.capNote).toContain("Round cap reached (MAX_ROUNDS=12)");
+  });
+
+  it("an OLD marker with no `rounds` field keeps today's history-length behaviour", () => {
+    // Back-compat half of the same change: without the counter the round number is
+    // the history length, exactly as before, so a marker in the wild is unaffected.
+    const settled = settle({
+      findings: [stamp("src/a.ts", "medium", "prefer a named constant here")],
+      reviewed: ["src/a.ts"],
+      unreviewed: [],
+      maxRounds: 12,
+      priorRounds: 10,
+    });
+
+    expect(settled.capped).toBe(false);
+    expect(settled.verdict).toBe("changes");
+  });
+
+  it("a blocker still overrides the counter at round 13", () => {
+    const settled = settle({
+      findings: [stamp("src/a.ts", "blocker", "this bypasses the auth check")],
+      reviewed: ["src/a.ts"],
+      unreviewed: [],
+      maxRounds: 12,
+      priorRounds: 10,
+      rounds: 12,
+    });
+
+    expect(settled.capped).toBe(false);
+    expect(settled.verdict).toBe("changes");
   });
 });

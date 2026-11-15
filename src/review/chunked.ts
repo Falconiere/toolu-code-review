@@ -14,7 +14,7 @@
 // `reviewed`, `unreviewed` (attempted and failed, incl. the MAX_CHUNKS spill) or
 // `pending` (wall clock ran out before it was attempted) — so the coverage ledger
 // (review/ledger.ts) can account for the whole diff with no silent skips.
-import { splitDiffByFile, packGroups } from "@/git/chunk.js";
+import { splitDiffByFile, packGroups, containsFullFile } from "@/git/chunk.js";
 import type { FileSegment } from "@/git/chunk.js";
 import { groupRelatedSegments } from "@/git/relate.js";
 import { countLines } from "@/git/diff.js";
@@ -44,7 +44,8 @@ export interface ChunkedReviewOptions {
   diff: DiffData;
   /** Per-chunk diff-line budget; ≤ 0 disables chunking (always one call). */
   maxChunkLines: number;
-  /** Max chunks (packages); files beyond spill out and are noted. 0 = unlimited.
+  /** Max chunks (packages); files beyond spill out and are ledgered
+   *  `unreviewed (chunk-limit)`. 0 = unlimited.
    *  NOT a model-call count: a package costs 1 call when it succeeds or fails
    *  unbisectably-without-retry, 2 with its one retry, and up to 7 when a schema
    *  failure bisects (1 + 2 halves + 4 quarters, review/bisect.ts) — so the call
@@ -126,13 +127,14 @@ export async function reviewChunked(opts: ChunkedReviewOptions): Promise<Provide
     (i) => runPackage(i),
   );
 
-  // Spilled files were never attempted: loud per-path (ledger) AND in the comment.
+  // Spilled files were never attempted: loud per-path, as `unreviewed (chunk-limit)`
+  // ledger rows the comment's Coverage section names. There is deliberately no
+  // prose footnote here — it used to ride `other_checks`, which settle.ts clears
+  // (free-form model commentary is never reconcilable with individual findings), so
+  // the notice was built and thrown away while the ledger rows already carried the
+  // same information path by path.
   reportCoverage(opts.onCoverage, dropped, { status: "unreviewed", reason: "chunk-limit" });
-  const merged = mergeResults([first, ...rest]);
-  if (dropped.length > 0) {
-    merged.other_checks = appendDroppedNotice(merged.other_checks, dropped, maxChunks);
-  }
-  return merged;
+  return mergeResults([first, ...rest]);
 }
 
 /** The whole diff in ONE call: the fast path and the degenerate fallback. Never
@@ -145,7 +147,7 @@ async function reviewWhole(opts: ChunkedReviewOptions): Promise<ProviderResult> 
     return mergeResults([]);
   }
   const result = await opts.review(opts.buildEnvelope(opts.diff, opts.mechanical, opts.brief));
-  const status = result.verdict === "error" ? "unreviewed" : "reviewed";
+  const status = result.verdict === "error" || result.partial === true ? "unreviewed" : "reviewed";
   for (const path of paths) opts.onCoverage(path, { status });
   return result;
 }
@@ -203,6 +205,9 @@ function contextFilesFor(
     if (seg.path === "") continue;
     const content = readFile(seg.path);
     if (content === null) continue;
+    // If every source line is already visible, attaching it again adds no
+    // context (especially expensive for newly added snapshots or large files).
+    if (containsFullFile(seg.diff, content)) continue;
     if (countLines(content) > MAX_CONTEXT_FILE_LINES) {
       process.stderr.write(
         `  Note: ${seg.path} exceeds ${MAX_CONTEXT_FILE_LINES} lines; ` +
@@ -229,16 +234,4 @@ function partitionMechanical(
     partitions[chunkOf.get(finding.path) ?? 0]?.push(finding);
   }
   return partitions;
-}
-
-/** Append a "files not reviewed (chunk limit reached)" note to the other-checks blurb. */
-function appendDroppedNotice(
-  otherChecks: string | undefined,
-  dropped: FileSegment[],
-  maxChunks: number,
-): string {
-  const names = dropped.map((s) => s.path).filter((p) => p !== "");
-  const list = names.length > 0 ? `: ${names.join(", ")}` : "";
-  const notice = `⚠️ ${dropped.length} file(s) were not reviewed — chunk limit (MAX_CHUNKS=${maxChunks}) reached${list}.`;
-  return otherChecks !== undefined && otherChecks !== "" ? `${otherChecks}\n\n${notice}` : notice;
 }

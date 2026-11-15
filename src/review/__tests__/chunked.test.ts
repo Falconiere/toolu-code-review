@@ -54,6 +54,29 @@ function recordingEnvelope(calls: Array<{ paths: string[]; mech: string[] }>) {
 }
 
 describe("reviewChunked", () => {
+  it("does not duplicate a fully visible new file as oversized-file context", async () => {
+    const diff = diffWithFiles([{ path: "src/new.ts", lines: 30 }]);
+    const content =
+      Array.from({ length: 30 }, (_, n) => `export const src_new_ts_${n} = ${n}`).join("\n") + "\n";
+    const seen: DiffData[] = [];
+    await reviewChunked({
+      diff,
+      maxChunkLines: 10,
+      maxChunks: 0,
+      mechanical: [],
+      brief: null,
+      onCoverage: () => {},
+      buildEnvelope: (d) => {
+        seen.push(d);
+        return STUB_ENVELOPE;
+      },
+      review: async () => APPROVED,
+      readFile: () => content,
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.diff).toContain("src_new_ts_29");
+    expect(seen[0]?.context_files ?? []).toEqual([]);
+  });
   it("fast path: a within-budget diff is one review call", async () => {
     const diff = diffWithFiles([{ path: "src/a.ts", lines: 3 }]);
     let calls = 0;
@@ -204,6 +227,10 @@ describe("reviewChunked", () => {
       Array.from({ length: 20 }, (_, n) => `pub fn ${tag}${n}() {}`).join("\n");
     // A multi-line raw string whose closing delimiter sits far from its opener.
     const content = `${filler("a")}\nconst BODY: &str = r#"\n${filler("b")}\n"#;\n${filler("c")}\n`;
+    writeFile(dir, "tests/live_e2e.rs", content.replace("pub fn b0() {}", "pub fn previous() {}"));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "base raw string", "--quiet");
+    git(dir, "branch", "-f", "main", "HEAD");
     writeFile(dir, "tests/live_e2e.rs", content);
     git(dir, "add", "-A");
     git(dir, "commit", "-m", "c", "--quiet");
@@ -315,24 +342,32 @@ describe("reviewChunked", () => {
     expect(result.error).toContain("NOT reviewed");
   });
 
-  it("notes files dropped by the chunk cap in other_checks", async () => {
+  it("surfaces files dropped by the chunk cap through the coverage ledger alone", async () => {
+    // The spill used to be appended to `merged.other_checks` as a prose footnote, but
+    // pipeline/settle.ts clears that field on every validated result (free-form model
+    // commentary cannot be reconciled with individual findings), so the notice was
+    // built and thrown away. The per-path `unreviewed (chunk-limit)` ledger rows are
+    // what actually reaches the comment's Coverage section — assert that, and that no
+    // dead footnote is written to a field nothing renders.
     const diff = diffWithFiles([
       { path: "a/big.ts", lines: 30 },
       { path: "b/big.ts", lines: 30 },
       { path: "c/big.ts", lines: 30 },
     ]);
+    const coverage = new Map<string, CoverageEntry>();
     const result = await reviewChunked({
       diff,
       maxChunkLines: 20,
       maxChunks: 2,
       mechanical: [],
       brief: null,
-      onCoverage: () => {},
+      onCoverage: (path, entry) => coverage.set(path, entry),
       buildEnvelope: () => STUB_ENVELOPE,
       review: async () => APPROVED,
     });
-    expect(result.other_checks).toContain("not reviewed");
-    expect(result.other_checks).toContain("c/big.ts");
+    expect(coverage.get("c/big.ts")).toEqual({ status: "unreviewed", reason: "chunk-limit" });
+    expect(result.other_checks ?? "").not.toContain("not reviewed");
+    expect(result.other_checks ?? "").not.toContain("chunk limit");
   });
 });
 
@@ -622,7 +657,7 @@ describe("reviewChunked bisection and coverage", () => {
     expect(events.slice(2, 4).sort()).toEqual(["start p2/a.ts", "start p3/a.ts"]);
   });
 
-  it("ledgers files spilled by the MAX_CHUNKS cap as unreviewed, not just a footnote", async () => {
+  it("ledgers files spilled by the MAX_CHUNKS cap as unreviewed", async () => {
     const { diff, maxChunkLines } = packedDiff(PKG_2, 4);
     const coverage = new Map<string, CoverageEntry>();
 

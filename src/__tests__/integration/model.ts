@@ -43,7 +43,9 @@ export interface ScriptedFinding {
   category?: string;
   confidence?: "high" | "medium";
   text: string;
+  quoted_line?: string;
   suggestion?: string;
+  conclusion?: "defect" | "no_defect";
 }
 
 /** A scripted answer to one Layer 2 package call. `fail: "schema"` returns

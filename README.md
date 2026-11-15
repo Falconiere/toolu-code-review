@@ -6,19 +6,162 @@
 
 ### AI code review for every pull request
 
-Audits the diff against an 8-dimension checklist — correctness, security, performance, test coverage, doc accuracy, tight assertions, migration warnings, and adherence to the project's own convention files — by running **one model** through either [OpenRouter](https://openrouter.ai) (any OpenAI-compatible model id) or a vendor's **native API** — DeepSeek (`api.deepseek.com`), MiniMax (`api.minimax.io`) or Kimi / Moonshot AI (`api.moonshot.ai`) — selected with a single `PROVIDER` input, via the **[Vercel AI SDK](https://sdk.vercel.ai)** (`generateObject` + Zod: structured output with retries, reasoning disabled). Posts a structured, machine-readable comment with inline, committable suggestions.
+Audits the diff against an 8-dimension checklist — correctness, security, performance, test coverage, doc accuracy, tight assertions, migration warnings, and adherence to the project's own convention files — by running **one model** through [OpenRouter](https://openrouter.ai) or a [custom OpenAI-compatible endpoint](#custom-endpoints-omlx-and-local-models), via the **[Vercel AI SDK](https://sdk.vercel.ai)** (`generateObject` + Zod: structured output with retries; reasoning disabled on OpenRouter). Posts a structured, machine-readable comment with inline, committable suggestions.
 
 [![Release](https://img.shields.io/github/v/release/Falconiere/toolu-ghactions?sort=semver&color=d97757)](https://github.com/Falconiere/toolu-ghactions/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Tests](https://img.shields.io/badge/tests-vitest-3fb950)](https://github.com/Falconiere/toolu-ghactions/actions/workflows/tests.yml)
 
-[Quick start](#quick-start) · [Choosing a model](#choosing-a-model) · [How it works](#how-it-works) · [Example verdict](#example-verdict) · [Coverage ledger](#coverage-ledger) · [Finding clustering](#finding-clustering) · [Custom identity](#custom-identity-github-app) · [@mention re-trigger](#mention-re-trigger) · [Review memory](#review-memory) · [Inputs](#inputs) · [Outputs](#outputs) · [v7 migration](#v7-migration)
+[Quick start](#quick-start) · [Choosing a model](#choosing-a-model) · [How it works](#how-it-works) · [Example verdict](#example-verdict) · [Coverage ledger](#coverage-ledger) · [Finding clustering](#finding-clustering) · [Custom identity](#custom-identity-github-app) · [@mention re-trigger](#mention-re-trigger) · [Settling findings](#settling-findings-without-a-re-review) · [Review memory](#review-memory) · [Inputs](#inputs) · [Outputs](#outputs) · [v8 migration](#v8-migration) · [v7 migration](#v7-migration)
 
 </div>
 
 > Part of the [**toolu-ghactions**](https://github.com/Falconiere/toolu-ghactions) monorepo.
 
 ---
+
+## Custom endpoints (oMLX and local models)
+
+Set `PROVIDER: openai-compatible`, `BASE_URL` to your API root and `MODEL_ID` to
+an id returned by that server's `/v1/models`. The endpoint must support OpenAI
+Chat Completions, streaming and `response_format: {type: "json_object"}` output.
+The SDK supplies the review schema in the prompt and validates the response with
+Zod; custom servers do not need native JSON schema enforcement.
+Responses still go through the existing review validation, retries and deadlines.
+OpenRouter routing and reasoning extras are not sent to custom servers; configure
+local reasoning behavior with `EXTRA_BODY` or on the server. `API_KEY` is optional for unauthenticated
+servers; when supplied it is sent as a Bearer token. Jev remains OpenRouter-only.
+
+For CI on a self-hosted Mac mini runner with oMLX listening on port 8000:
+
+```yaml
+jobs:
+  review:
+    runs-on: [self-hosted, macOS, ARM64]
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: falconiere/toolu-ghactions/code-review@custom-endpoint
+        with:
+          PROVIDER: openai-compatible
+          BASE_URL: http://127.0.0.1:8000/v1
+          MODEL_ID: Qwen3.5-9B-MLX-4bit
+          API_KEY: ${{ secrets.LOCAL_LLM_API_KEY }} # omit if your server needs no auth
+          EXTRA_BODY: '{"chat_template_kwargs":{"enable_thinking":false}}'
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUEST_TIMEOUT_MS: '300000' # local generation can take longer
+          FAIL_ON: none # advisory while evaluating the local model
+```
+
+With a public tunnel, use `BASE_URL: https://omlx.codasignal.com/v1` on a
+GitHub-hosted runner and store the oMLX key in `secrets.LOCAL_LLM_API_KEY`.
+
+The branch pin above is for testing this change; pin a release or commit containing
+it for ongoing use. Port 8000 is an example: use your oMLX server's actual port.
+A GitHub-hosted runner needs network access to your Mac mini through your VPN or
+an authenticated tunnel. Your workstation's `ssh macmini` alias does not make the
+Mac reachable from GitHub CI. With an SSH tunnel established by a prior workflow
+step, use its forwarded local port in `BASE_URL`.
+
+For a live local smoke test, without posting to GitHub:
+
+```bash
+cd code-review
+TOOLU_LIVE_BASE_URL=http://127.0.0.1:8000/v1 \
+TOOLU_LIVE_MODEL=Qwen3.5-9B-MLX-4bit \
+TOOLU_LIVE_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}' \
+bun run test -- src/llm/__tests__/custom-endpoint-live.test.ts
+# Supply TOOLU_LIVE_API_KEY in the environment if the endpoint requires auth.
+```
+
+The eval CLI also accepts `--provider openai-compatible --base-url <api-root>
+--model <id> --extra-body '{"chat_template_kwargs":{"enable_thinking":false}}'`;
+`API_KEY` is optional for that provider.
+
+## Optional Jev assessments (OpenRouter only)
+
+Set `JEV_ENABLED: 'true'` with `PROVIDER: openrouter`. Jev reuses `API_KEY`;
+`JEV_MODEL_ID` defaults to `typesafe/jev-1.13`. The generative reviewer still uses
+`MODEL_ID`. Enabling Jev with `openai-compatible` fails input validation.
+
+```yaml
+with:
+  PROVIDER: openrouter
+  API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+  JEV_ENABLED: 'true'
+  JEV_MODEL_ID: typesafe/jev-1.13
+```
+
+Requests use [OpenRouter's System One endpoint](https://openrouter.ai/docs/guides/community/typesafe-sdk),
+never a direct TypeSafe API or separate credential. Baseline package review and
+source validation finish first. Incomplete baseline coverage (any partial package or
+unreviewed file) skips enhancements; the note then reads
+`N skipped (baseline coverage incomplete)`, or `(wall deadline reached)` when the
+deadline expired first.
+Every enhancement request, retry and recheck shares the original `MAX_WALL_MS`
+deadline. Runtime defaults, package cap, concurrency and resume behavior remain unchanged.
+
+Jev assesses fresh LLM findings as supported, contradicted or insufficient evidence.
+A challenge alone cannot remove a finding: the configured generative reviewer must
+explicitly dismiss its exact identity with an explanation and a quote verified against
+supplied source. Missing/invalid answers, uncertainty, failures and expired deadlines
+retain baseline findings. Scanner findings and carried historical findings cannot be
+automatically dismissed. Revised/additional findings undergo the normal quote,
+anchor, confidence, suggestion and deduplication checks.
+
+After rechecks, at most two packages classified high risk with confidence ≥0.8 receive
+one additional generative review each. Candidates are ordered by high-risk probability,
+then original package order. This is an initial routing threshold, not an accuracy guarantee.
+No enhancement recursively starts another pass or claims additional baseline coverage.
+
+Evidence is captured from the exact reviewed tree: package diff, bounded nearby
+source/tests and the same project rules as the baseline. Repository text is evidence,
+never instructions. Independent questions are batched; oversized question sets are
+split without truncating evidence. Requests use bounded byte estimates (90k state-plus-question / 180k total bytes)
+for Jev's documented 32k / 64k token limits. Tokenization varies: oversized evidence
+or a server context-limit rejection is reported unavailable, never retried with
+truncated source. The comment summarizes completed,
+unavailable and skipped work; logs record resolved Jev model, returned usage/cost and
+timing, without source or credentials.
+
+### Prompt efficiency and evaluation
+
+The default checklist keeps eight dimensions and source-grounding rules in under
+4,400 UTF-8 bytes. It requests empty `other_checks` and `top_must_fix` because those
+fields are discarded or derived from validated findings. Package prompts retain a
+cache-friendly shared prefix; source is bounded and duplicate full-file context is
+omitted. The manifest-only cartographer cannot establish runtime behavior. Focused
+rechecks send one finding identity and essential claim fields; extra reviews receive
+only existing findings in their package. Custom `REVIEW_PROMPT_FILE` content remains
+user-controlled and is not covered by the default-checklist size budget.
+
+Run a paired comparison on a real PR without posting to GitHub:
+
+```bash
+cd code-review
+API_KEY=... bun evals/run.ts --compare-jev --pr owner/repo#123 \
+  --model deepseek/deepseek-v4-flash --max-wall-ms 600000 --out comparison.json
+```
+
+`--base-sha` and `--head-sha` pin historical revisions. Both variants use the same
+real Git tree, including unchanged supporting files. Baseline responses are replayed
+with their measured request latency for the enhanced variant, preserving its budget.
+Incomplete baseline coverage skips the paired enhanced run.
+The report includes exact revisions, coverage, findings, model calls, returned usage,
+cost and runtime. Replayed baseline calls incur no second API charge; measured enhanced
+wall time includes their replayed latency.
+
+`--expectations labels.json` accepts `[{"path":"src/file.ts","text":"distinctive claim",
+"expected":"defect"}]` (or `false_positive`). Matching is deterministic by path and
+case-insensitive text substring. Unmatched findings are explicitly unclassified and
+need human adjudication. Use representative known false positives and cross-file defects
+to evaluate routing and prompt changes; fewer tokens or fewer findings alone do not
+establish better review quality. Run `bun run test:evals` for harness tests.
 
 ## Quick start
 
@@ -31,6 +174,7 @@ on:
     types: [opened, synchronize, ready_for_review, reopened]
 
 permissions:
+  actions: read # upload-sarif reads workflow-run metadata
   contents: read
   pull-requests: write
   issues: write
@@ -47,7 +191,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history so the merge-base resolves without deepening
-      - uses: falconiere/toolu-ghactions/code-review@v4
+      - uses: falconiere/toolu-ghactions/code-review@v8
         with:
           API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 ```
@@ -58,7 +202,7 @@ jobs:
 Use `MODEL_ID` to switch models and `REVIEW_PROMPT_FILE` for a custom checklist:
 
 ```yaml
-      - uses: falconiere/toolu-ghactions/code-review@v4
+      - uses: falconiere/toolu-ghactions/code-review@v8
         with:
           PROVIDER: openrouter
           MODEL_ID: 'anthropic/claude-sonnet-4'
@@ -70,19 +214,17 @@ On every PR push, the action shapes the diff, sends it to the configured model, 
 
 ## Choosing a model
 
-The action runs **one model**, selected with three flat inputs:
+The action runs **one model**, selected with these inputs:
 
-- **`PROVIDER`** — `openrouter` (default), or a vendor's native API billed to that
-  vendor's own key: `deepseek`, `minimax`, or `kimi` (`moonshot` is accepted as an alias).
-- **`MODEL_ID`** — the model id (per-provider default if omitted).
-- **`API_KEY`** — the provider API key (**required**).
+- **`PROVIDER`** — `openrouter` (default) or `openai-compatible`.
+- **`MODEL_ID`** — model id; OpenRouter defaults to `deepseek/deepseek-v4-pro`, custom endpoints require it.
+- **`API_KEY`** — Bearer key; required for OpenRouter, optional for unauthenticated custom endpoints.
+- **`BASE_URL`** — required API root for custom endpoints; see [oMLX and local models](#custom-endpoints-omlx-and-local-models).
 
-By default it is resolved through OpenRouter; you can also point it at a **native
-vendor API** (see below). Anything OpenRouter serves works as long as it's
-OpenAI-compatible:
+Anything OpenRouter serves works as long as it's OpenAI-compatible:
 
 ```yaml
-- uses: falconiere/toolu-ghactions/code-review@v4
+- uses: falconiere/toolu-ghactions/code-review@v8
   with:
     PROVIDER: openrouter
     MODEL_ID: 'anthropic/claude-sonnet-4-5'   # default: deepseek/deepseek-v4-pro
@@ -104,74 +246,44 @@ the action surfaces an `error` verdict carrying the finish reason — rendered a
 "🚫 Review incomplete" and labeled `request-changes`, so a failed review
 never auto-merges. It never emits a silent null verdict.
 
-### Native DeepSeek API
+### Native vendor APIs (removed)
 
-To call DeepSeek's own API (`api.deepseek.com`) directly instead of going through
-OpenRouter — lower cost, direct billing — set `PROVIDER: deepseek` and a **native**
-model id (no vendor prefix):
+The native vendor backends this action used to ship — `deepseek`
+(`api.deepseek.com`), `minimax` (`api.minimax.io`) and `kimi`/`moonshot`
+(`api.moonshot.ai`) — are **gone**. Every model they serve is reachable through
+OpenRouter under a `<vendor>/<model>` id, so the migration is one input pair:
 
-```yaml
-- uses: falconiere/toolu-ghactions/code-review@v4
-  with:
-    PROVIDER: deepseek
-    MODEL_ID: deepseek-v4-flash
-    API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-```
+| Removed | Vendor on OpenRouter | Starting point — **verify before pinning** |
+|---|---|---|
+| `PROVIDER: deepseek` + `MODEL_ID: deepseek-v4-flash` | `deepseek` | `deepseek/deepseek-v4-flash` |
+| `PROVIDER: minimax` + `MODEL_ID: MiniMax-M3` | `minimax` | `minimax/minimax-m3` |
+| `PROVIDER: kimi` + `MODEL_ID: kimi-k2.7-code` | `moonshotai` (**not** `kimi`) | `moonshotai/kimi-k2` |
 
-`PROVIDER: deepseek` hits `api.deepseek.com` directly (lower cost, direct billing).
-`MODEL_ID` takes a **native** DeepSeek model id (no vendor prefix) and defaults to
-`deepseek-v4-flash` (fast, 1M context) when omitted. `API_KEY` is your
-DeepSeek key — here `${{ secrets.DEEPSEEK_API_KEY }}` is just the name of *your*
-GitHub repo secret, passed into the single `API_KEY` input.
+**Look every one of these up at [openrouter.ai/models](https://openrouter.ai/models)
+before you pin it.** The right-hand column is a starting point, not a verified id:
+two of the three were composed by the same vendor-name-plus-model rule the action
+itself refuses to trust, and the Kimi row proves why — its namespace is
+`moonshotai/`, and `kimi-k2.7-code` (code-specialised) has no exact OpenRouter
+twin, so `moonshotai/kimi-k2` is a general-purpose substitute that will review
+differently. Prefer a model with reliable JSON structured output.
 
-### Native MiniMax API
+…plus an `API_KEY` that is now your **OpenRouter** key, not the vendor's. A
+`PROVIDER` still pinned to a removed vendor fails the action, pointing you at the
+catalog to find the id — it is never silently rerouted, because the vendor key in
+`API_KEY` would only 401 mid-review.
 
-To bill the review to your MiniMax key, set `PROVIDER: minimax` and a **native**
-MiniMax model id:
+Use `openai-compatible` with `BASE_URL` for a direct custom server. Unsupported
+`PROVIDER` values fail the action with that same error. It names [openrouter.ai/models](https://openrouter.ai/models)
+rather than composing an id from the value you typed: that composition is precisely
+what produced the unusable `kimi/…` advice this action used to print.
 
-```yaml
-- uses: falconiere/toolu-ghactions/code-review@v7
-  with:
-    PROVIDER: minimax
-    MODEL_ID: MiniMax-M3            # default; also MiniMax-M2.7, MiniMax-M2.5, …
-    API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-```
-
-`PROVIDER: minimax` hits `api.minimax.io` directly. `MODEL_ID` defaults to
-`MiniMax-M3` (1M context, the `deepseek-v4-flash` price tier) when omitted. The
-action sends `thinking: {type: "disabled"}`, which `MiniMax-M3` honours; the M2.x ids
-think on every call regardless, so their reasoning is billed against `MAX_TOKENS` —
-the action keeps it out of the JSON (`reasoning_split`) and retries a response that
-ran out of budget before any JSON started at the doubled budget, but a larger
-`MAX_TOKENS` is the cheaper fix if you pick one. MiniMax silently ignores
-`response_format`, so the verdict schema reaches the model through the prompt alone.
-
-### Native Kimi (Moonshot AI) API
-
-To bill the review to your Kimi key, set `PROVIDER: kimi` (or `moonshot`) and a
-**native** Kimi model id:
-
-```yaml
-- uses: falconiere/toolu-ghactions/code-review@v7
-  with:
-    PROVIDER: kimi
-    MODEL_ID: kimi-k2.7-code        # default; also kimi-k3, kimi-k2.6, kimi-k2.7-code-highspeed
-    API_KEY: ${{ secrets.KIMI_API_KEY }}
-```
-
-`PROVIDER: kimi` hits `api.moonshot.ai` directly (the host did not change with the
-`platform.kimi.ai` rebrand). `MODEL_ID` defaults to `kimi-k2.7-code` (262K context,
-the code-specialised model with Kimi's most stable structured output) when omitted;
-`kimi-k3` is the 1M-context flagship at roughly 4x the price. Two Kimi-specific
-behaviours: the current models reject any explicit sampling value, so the action
-sends no `temperature` to Kimi (the vendor default applies), and they reason on
-every call with no way to switch it off, so the reasoning is billed against
-`MAX_TOKENS` — a response that ran out of budget before any JSON started is retried
-at the doubled budget, and a larger `MAX_TOKENS` is the cheaper fix on big chunks.
-
-Only `openrouter` (default), `deepseek`, `minimax` and `kimi` are implemented; any
-other `PROVIDER` value fails the action with an error that points you at routing it
-through OpenRouter instead (`PROVIDER: "openrouter"`, `MODEL_ID: "<vendor>/<model>"`).
+**Half-done migrations warn.** Flipping `PROVIDER` but leaving `MODEL_ID` on the
+vendor's bare native id (`deepseek-v4-flash`, `MiniMax-M3`, `kimi-k2.7-code`) is
+the common slip: OpenRouter ids are namespaced `<vendor>/<model>` and it rejects a
+bare one. The action logs a warning at input-read time naming `MODEL_ID` as the
+likely cause. It is a warning, not a hard failure — the run still proceeds and
+still fails at the first model call if the id really is wrong, but the log says
+why instead of leaving you with a bare 400.
 
 ### Removed in v4 (migration)
 
@@ -181,7 +293,7 @@ are not silent no-ops). Migrate to the three flat provider inputs:
 
 | Removed input | Replacement |
 |---|---|
-| `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY` | `API_KEY` (the key for the selected `PROVIDER`) |
+| `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY` | `API_KEY` (your OpenRouter key) |
 | `MODEL` | `MODEL_ID` |
 | `PROVIDERS` | `PROVIDER` + `MODEL_ID` + `API_KEY` (a single model only) |
 | `MERGE_STRATEGY`, `FALLBACK_MODEL`, `REVIEW_MODE`, `ENFORCE_JSON_SCHEMA` | removed — one model, schema always enforced |
@@ -197,7 +309,7 @@ reproducible and means a provider error never leaves the PR un-reviewed.
 
 Both run as steps of this composite action (pinned release binaries) and write SARIF.
 Their findings (1) **upload to the repo's Code Scanning tab** — which requires
-`security-events: write` in your workflow `permissions` — and (2) are passed to the LLM
+`security-events: write` and `actions: read` in your workflow `permissions` — and (2) are passed to the LLM
 as TRUSTED context to assess; confirmed ones appear in the verdict comment tagged with
 their tool. A scanner that fails to install or run is non-fatal: the review degrades to
 LLM-only. On a **fork PR** (where `security-events: write` and the token are read-only) the
@@ -234,6 +346,8 @@ The noise filter (each dropped file is reported in the comment) covers:
   (`*.bundle.js`), plus any file flagged `@generated`/`DO NOT EDIT` by content.
 - **Repo-marked generated** — any path with `linguist-generated` in
   `.gitattributes` (the same signal GitHub's diff UI uses).
+- **Drizzle metadata** — numbered `meta/*_snapshot.json` and `meta/_journal.json`
+  under `drizzle/` or `migrations/`. SQL migrations and source schemas stay in review.
 - **Your own globs** — anything matched by the `EXCLUDE_GLOBS` input.
 
 Migrations (`migrations/`) and snapshot tests (`*.snap`) are **kept** for review
@@ -242,16 +356,23 @@ by default — add them to `EXCLUDE_GLOBS` if you'd rather skip them.
 **2 — Gather rules.** Reads the repo's own convention files from the base ref and
 folds them into the prompt (see [Project conventions](#project-conventions)).
 
-**3 — Review.** Builds the system + user prompt and calls the configured model (the
-`PROVIDER` backend — OpenRouter or a native vendor API) via
-the Vercel AI SDK (`generateObject` + a Zod verdict schema) against the full
+Each review package also receives read-only evidence from the exact reviewed Git
+tree: a bounded repository file inventory, nearby tests, package export maps,
+and supporting source reached through relative imports and workspace exports.
+Common `@/` imports supply candidate files from the owning package's `src/`;
+these candidates are context, not a replacement for TypeScript's resolver.
+Supporting imports are followed for two additional hops. Source context is capped
+at 16 KiB per file and 32 KiB per package; the inventory is capped at 16 KiB.
+Omissions are explicit, and the checklist forbids inferring missing code or tests
+from incomplete context. Source already fully visible in the diff is not attached
+again. Context cannot expand the changed lines on which findings may be reported.
+
+**3 — Review.** Builds the system + user prompt and calls the configured OpenRouter
+model via the Vercel AI SDK (`generateObject` + a Zod verdict schema) against the full
 8-dimension checklist (the 8th, convention adherence, applies only when project
-rules were found). Output is structured with automatic retries; reasoning is off on
-every backend that has a switch (`reasoning: {effort: "none"}` on OpenRouter,
-`thinking: {type: "disabled"}` on native DeepSeek and MiniMax) — it is billed against
-`MAX_TOKENS`, so a thinking model spends the budget before emitting any JSON. Kimi's
-current models have no switch, so there (and on MiniMax's M2.x ids) a response that
-ran out of budget before any JSON started is retried at the doubled budget instead.
+rules were found). Output is structured with automatic retries; reasoning is off
+(`reasoning: {effort: "none"}`) — it is billed against `MAX_TOKENS`, so a thinking
+model spends the budget before emitting any JSON.
 
 A response the schema rejects is not thrown away on sight: the findings completed
 before a truncation cut are salvaged, and a complete response that merely deviates
@@ -269,7 +390,22 @@ review over findings that had to be dropped.
 **4 — Validate & anchor.** Findings are checked against the diff — hallucinated
 line numbers and low-confidence findings are dropped, findings are deduplicated by
 `(path, line, end_line, text-fingerprint)` keeping the highest severity, and each
-is anchored to a real changed line.
+is anchored to a real changed line. Fresh LLM findings must quote source text from
+their cited line; missing or mismatched evidence leaves the affected coverage
+unreviewed rather than turning an unsupported claim into a clean approval. A finding
+the model withdraws (`conclusion: "no_defect"`, written after its `text`) or whose own
+text concludes there is no defect ("… is safe. No defect, abstain.", "No deadlock
+risk.") is dropped before posting: it opens no thread, adds to no severity count, and
+cannot hold a "changes" verdict. Existing
+stored findings remain compatible. Top-N recommendations use only surviving findings.
+Settled findings are removed as whole repeated-finding groups before source
+validation, so their stale quotes cannot make a completed review incomplete.
+Dismissed threads retain their corrective explanations in the prompt. Repeated
+findings in the summary use only surviving groups; free-form model “Other checks”
+are omitted because they can repeat claims that validation or dismissal rejected.
+Local source-evidence and coverage failures are identified separately from provider
+errors. Logs include up to five rejected quote locations and any matching lines,
+without copying the source text into the log.
 
 **5 — Post.** A summary verdict comment (machine-readable label for `pr-babysit`),
 plus — when `INLINE_COMMENTS` is on — per-line review comments with committable
@@ -329,7 +465,7 @@ A generative reviewer re-derives its findings from the diff on every push, so le
 
 With `INLINE_COMMENTS: true` (default), findings are posted as inline review comments anchored to the exact file and line, batched at up to 30 comments per `createReview` call. When the model has a concrete, high-confidence fix it attaches a ` ```suggestion ` block you can commit straight from the PR. Anchors are validated against GitHub's own view of the PR diff before posting: a finding on a file GitHub's own diff omits (or whose line can't be mapped onto it) is **never** posted inline — GitHub's Reviews API rejects the whole `createReview` call outright if it contains even one such comment, so there is no file-level fallback. It is instead rendered in the sticky comment's [`### Unanchored findings`](#coverage-ledger) section, so it is never silently lost. If a batch still fails after anchor validation (a comment GitHub's API rejects for a reason we couldn't predict up front), the batch is bisected to isolate the poison comment — every other comment in the batch still posts, and the isolated one is rendered in the sticky comment's [`### Findings GitHub rejected inline`](#coverage-ledger) section, so one bad comment can no longer zero out the whole review or silently drop a finding. Set `INLINE_COMMENTS: false` for a summary-comment-only review.
 
-The verdict comment is compatible with [`parse-verdict.sh`](https://github.com/Falconiere/toolu/blob/main/plugins/pr-babysit/scripts/parse-verdict.sh) and the [`pr-babysit`](https://github.com/Falconiere/toolu/tree/main/plugins/pr-babysit) automation loop, so toolu users can drop this into CI and their existing babysit workflow consumes the verdict without changes. The elements that contract depends on — the `### Code Review` heading, at least one checked `- [x]` box, the `### Findings` block, and the machine-readable label — are present in **both** verbosity modes (below).
+The verdict comment is compatible with [`parse-verdict.sh`](https://github.com/Falconiere/toolu/blob/main/plugins/pr-babysit/scripts/parse-verdict.sh) and the [`pr-babysit`](https://github.com/Falconiere/toolu/tree/main/plugins/pr-babysit) automation loop, so toolu users can drop this into CI and their existing babysit workflow consumes the verdict without changes. The elements that contract depends on — the `### Code Review` heading, at least one checked `- [x]` box, the `### Findings` block, and the machine-readable label — are present in **both** verbosity modes (below). `parse-verdict.sh` reads both the current grouped-block findings layout and the older one-line-per-finding shape, so an older comment on a long-lived PR still parses; a babysit loop pinned to a **pre-7.3 copy** of the script reads the verdict, the label and completeness as before, but recovers no findings from a comment written by this version until that copy is updated.
 
 ## Example verdict
 
@@ -349,10 +485,18 @@ Reviewing 4 files: 1 correctness-critical (format.ts), 1 test-quality, 1 config,
 1 security-sensitive (login.ts).
 
 ### Findings (2)
-`src/utils/format.ts:17`: low: Comment says 'Temporary workaround' with no
-removal date or tracking issue.
-`src/utils/__tests__/format.test.ts:6`: low: Test assertion uses loose suffix
-match. Tighten to assert full identity.
+
+#### 🔵 Low · 2
+
+**1.** `src/utils/format.ts` **L17**
+<sub>doc/comment accuracy · high confidence</sub>
+
+Comment says 'Temporary workaround' with no removal date or tracking issue.
+
+**2.** `src/utils/__tests__/format.test.ts` **L6**
+<sub>test quality · high confidence</sub>
+
+Test assertion uses loose suffix match. Tighten to assert full identity.
 
 `merge-approved`
 ```
@@ -361,6 +505,8 @@ match. Tighten to assert full identity.
 
 - **`compact`** (default) — the checklist collapses to one line, and the review-memory recap lists changed findings as `` `path:line` `` refs (the full text already lives once in `### Findings`).
 - **`full`** — restores the five-line static checklist and the inline recap text.
+
+**Findings layout.** Findings render as one block per finding, grouped under a `#### <severity>` sub-heading (worst-severity group first) and numbered continuously: a bold location line, a small meta line (`category · confidence`, plus `[gitleaks]`/`[opengrep]` when a deterministic tool confirmed it), then the text as its own paragraph. GitHub runs consecutive lines together as one block of body text, so the previous one-line-per-finding list arrived as a wall on any PR with more than a handful of findings.
 
 These changes apply in **both** modes, independent of `VERBOSITY`:
 
@@ -448,7 +594,7 @@ Prefer clicking through github.com → Settings → Developer settings → GitHu
 ### Use it
 
 ```yaml
-- uses: falconiere/toolu-ghactions/code-review@v4
+- uses: falconiere/toolu-ghactions/code-review@v8
   with:
     API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     APP_ID: ${{ secrets.APP_ID }}
@@ -493,6 +639,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # upload-sarif reads workflow-run metadata
   pull-requests: write
   issues: write
   security-events: write # upload the gitleaks/opengrep SARIF to the Code Scanning tab
@@ -508,7 +655,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: falconiere/toolu-ghactions/code-review@v4
+      - uses: falconiere/toolu-ghactions/code-review@v8
         with:
           API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 ```
@@ -532,7 +679,6 @@ checkout step is needed.
   is sanitized and injected into the user prompt inside a delimited UNTRUSTED
   block as a hint about *where* to look — **never** as instructions, and it
   cannot change the task, output schema, or verdict rules.
-- An allowed trigger reacts 👀 on the comment; a denied one reacts 👎.
 - A scoped/steered review (`@toolu review focus on …`) does **not** recompute
   "resolved" — see [Review memory](#review-memory).
 
@@ -550,7 +696,75 @@ When `MAX_WALL_MS` cuts a run short mid-review, the sticky comment says so, and 
 
 `@toolu resume` never re-reviews files that already reached complete coverage, and never clears memory or `reviewed_tree`. Contrast with `@toolu review`, which is still a **full** re-review — it clears `reviewed_tree` and both exception lists and starts over. If there is nothing left to resume (no exception paths recorded — e.g. a run that never actually paused), `@toolu resume` falls back to a full review rather than silently doing nothing.
 
+## Settling findings without a re-review
+
+Replying `@toolu dismiss` on one of the bot's inline threads, or arguing a finding out
+(see [Dismissing a finding](#dismissing-a-finding-without-resolving-the-thread)), settles
+that finding — but **a dismissal does not start a new LLM review**. On the default
+`pull_request`-only workflow nothing re-evaluates until the next push; wiring the reply
+into the `@mention` workflow instead would re-run the whole review, which on the same
+commit can re-roll the findings. For the label to follow your replies immediately, add a
+small **second** workflow on `pull_request_review_comment`:
+
+```yaml
+name: Code Review — settle
+on:
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: code-review-settle-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  settle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: falconiere/toolu-ghactions/code-review@v8
+        with:
+          # Mirror your review workflow's APPROVE_BELOW, TRIGGER_PHRASE,
+          # MIN_TRIGGER_PERMISSION and MANAGE_LABELS (and APP_ID / APP_PRIVATE_KEY
+          # when the review posts as a GitHub App). No API_KEY — no model is called.
+          APPROVE_BELOW: nit
+```
+
+On each new reply, the action reads the last completed review's findings from the sticky
+comment's memory marker, drops the ones now settled on their threads (resolved, `@toolu
+dismiss`, or argued out — same permission gate and blocker rules as above), and — when
+nothing blocking remains under [`APPROVE_BELOW`](#advisory-findings-below-a-severity-threshold)
+— swaps `request-changes` for `merge-approved` and adds a `Settled` note under the sticky's
+verdict line, **within that run**. It never calls the model, never posts findings or
+replies, never resolves threads (the next full review still closes dismissed ones), never
+checks out or scans code, and never rewrites the memory marker.
+
+It fails closed and changes **nothing** (the log says `[SKIP] settle: <reason>`) when the
+PR has a newer push than the last review, the last review was incomplete or errored,
+findings are still blocking, the sticky comment was not posted by a bot, the PR head cannot
+be read, or `REVIEW_MEMORY` is off.
+
+- **Keep it a separate workflow.** Sharing the review's per-PR `cancel-in-progress`
+  group would let a reply cancel a running review.
+- **Don't make its job a required status check.** Its output is the label, which
+  `merge-gate` and branch protection read; a reply that settles nothing
+  reports `skip` and must not stand in for the review's own check.
+
+[`merge-gate`](../merge-gate/README.md#settled-findings) runs the same recompute on its own,
+read-only, whenever the label is missing. So its required check turns green on the reply
+itself even without this workflow, or when this workflow's label write lands after the
+gate has already read the labels.
+
 ## Review memory
+
+If a push rewrites history and the stored review tree is missing locally, the
+action attempts one bounded fetch of the previously reviewed commit from
+`origin`, without moving the checkout or `FETCH_HEAD`. If the server no longer
+provides that object, it falls back to a full review; it never assumes missing
+history means unchanged code.
 
 With `REVIEW_MEMORY: true` (default), each review recaps what changed since the
 last pass instead of starting from scratch:
@@ -587,11 +801,13 @@ earlier inline threads instead of blindly re-posting every finding:
   its thread is **resolved** (with a short note) rather than raised again.
 - 💬 **argues** — a finding the model still stands by is re-stated **as a reply in the
   existing thread** (engaging the author's reasoning), not as a duplicate comment.
-- ⤵️ **dedup** — only genuinely new findings open new threads; leftover duplicate
-  threads for the same finding are resolved.
-- 🔒 **respects resolutions** — **resolving a bot thread dismisses that finding**:
-  on later runs it is dropped from the verdict count, the summary comment, and
-  inline posting alike, instead of being re-litigated forever. When every
+- ⤵️ **dedup** — new findings and surviving blockers with only a loose match to a
+  resolved thread open actionable threads; leftover duplicate open threads for
+  the same finding are resolved.
+- 🔒 **respects resolutions** — **resolving a bot thread dismisses findings it
+  actually settles**: on later runs they are dropped from the verdict count,
+  the summary comment, and inline posting alike. A nearby reworded blocker is
+  not settled by that loose match and gets a fresh inline thread. When every
   remaining finding was human-resolved, a `request-changes` verdict downgrades to
   `merge-approved`. This works even with `INLINE_COMMENTS: false` (threads from
   earlier inline-enabled runs still suppress). Resolved threads are also fed to
@@ -623,6 +839,10 @@ more channels close that:
   silences a `blocker` (the same rule [`MAX_ROUNDS`](#convergence-settled-threads--the-round-cap)
   follows).
 
+Either way the verdict and label move on the **next review run** — or immediately, on
+the reply itself, with the [settle workflow](#settling-findings-without-a-re-review)
+(no model call).
+
 Both are gated on the **same repo permission** as the `@mention` re-trigger
 (`MIN_TRIGGER_PERMISSION`, default `write`) and **fail closed** — an unprivileged
 commenter cannot silence the reviewer, and a failing permissions API leaves the finding
@@ -643,14 +863,17 @@ resolution without posting the note again.
 
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `PROVIDER` | no | `openrouter` | Backend to call: `openrouter` (any OpenAI-compatible model via OpenRouter), or a vendor's native API billed to that vendor's key — `deepseek` (`api.deepseek.com`), `minimax` (`api.minimax.io`), or `kimi` (Moonshot AI, `api.moonshot.ai`; `moonshot` is accepted as an alias). Any other value fails the action with an error suggesting `PROVIDER: "openrouter"` + `MODEL_ID: "<vendor>/<model>"`. See [Native DeepSeek API](#native-deepseek-api), [Native MiniMax API](#native-minimax-api), [Native Kimi API](#native-kimi-moonshot-ai-api). |
-| `MODEL_ID` | no | per-provider | Model id. Defaults to `deepseek/deepseek-v4-pro` for `openrouter` (1M-token context, 384k max output, so large diffs and verbose reviews rarely truncate), `deepseek-v4-flash` for `deepseek`, `MiniMax-M3` for `minimax`, and `kimi-k2.7-code` for `kimi`. Use `<vendor>/<model>` ids for OpenRouter; bare native ids for the native providers. Pick one with reliable JSON structured output. |
-| `API_KEY` | **yes** | — | API key for the selected `PROVIDER` (OpenRouter, DeepSeek, MiniMax, or Kimi). **Required** — an empty value fails the action. Pass via a step-level `env:`/`secrets` reference for secret hygiene. |
+| `PROVIDER` | no | `openrouter` | `openrouter` or `openai-compatible`. Custom endpoints require `BASE_URL` and `MODEL_ID`. |
+| `MODEL_ID` | no | `deepseek/deepseek-v4-pro` (OpenRouter) | Endpoint model id; required for `openai-compatible`. |
+| `API_KEY` | OpenRouter only | — | Bearer key; optional for an unauthenticated custom endpoint and the no-model settle pass. |
+| `BASE_URL` | custom endpoints only | — | HTTP(S) API root, including `/v1` when needed. Rejected for OpenRouter. |
+| `EXTRA_BODY` | no | — | JSON object of custom server fields, e.g. oMLX `chat_template_kwargs`. Compatible provider only; review wire fields cannot be overridden. |
 | `MAX_TOKENS` | no | `8192` | Max completion-token budget per request (always sent — omitting it makes OpenRouter reserve the model's full output window against your credits and can 402-reject). A response truncated at this limit (`finish_reason: length`) is retried with a doubled budget up to the 131072 ceiling (escalations don't consume hang retries); whatever the outcome, the findings completed before a cut are salvaged. |
-| `MIN_CONFIDENCE` | no | `high` | Drop findings below this confidence unless severity is blocker/high (`high` or `medium`) |
+| `MIN_CONFIDENCE` | no | `high` | Drop findings below this confidence at every severity, including blocker/high (`high` or `medium`) |
 | `INLINE_COMMENTS` | no | `true` | Post per-line review comments with committable code suggestions (Reviews API), in addition to the summary comment |
 | `MANAGE_LABELS` | no | `true` | Set a real PR label chip matching the verdict (`merge-approved` / `request-changes`) and remove the opposite one. Requires `issues: write`. |
 | `FAIL_ON` | no | `changes` | Comma-separated verdicts that **fail the job** (turn this check red so branch protection can block the PR): `changes`, `error`, or both. **Defaults to `changes`** — the job goes red when the bot requests changes. Set `none` to keep the job green on every verdict (advisory only), or `changes,error` to also block when the review could not run (`error`). The comment, label, and outputs are still posted; only the exit code changes. Governs the verdict-driven gate only — a thrown infra error fails the job regardless. **Mark this check Required in branch protection** for the red to actually block a merge. See [Blocking merges](#blocking-merges). |
+| `APPROVE_BELOW` | no | `nit` | The lowest finding severity that still **withholds the `merge-approved` label**: `blocker`, `high`, `medium`, `low`, or `nit` (aliases like `critical` normalize the same way finding severities do). Findings strictly below this level no longer block the label — they still post inline, in the summary, and in the verdict text; only the label rule changes. **Defaults to `nit`**, the lowest severity, which preserves the pre-existing behavior where any finding withholds `merge-approved`. Independent of `FAIL_ON`: `FAIL_ON` governs the job exit code from the verdict; `APPROVE_BELOW` governs only the `merge-approved`/`request-changes` label. An incomplete or partial review still yields `request-changes` regardless of this setting. See [Blocking merges](#blocking-merges). |
 | `BASE_BRANCH` | no | `main` | Base branch for diff comparison. Falls back to `GITHUB_BASE_REF` if unset. |
 | `REVIEW_PROMPT_FILE` | no | *(8-dimension checklist)* | Path to a markdown file (relative to repo root) with a custom review prompt. Overrides the default checklist. Project conventions are still gathered and injected, but a custom prompt supplies its own dimensions. |
 | `CODEBASE_OVERVIEW` | no | — | High-level context about the codebase (framework, patterns, architecture) injected into the review prompt. |
@@ -663,12 +886,12 @@ resolution without posting the note again.
 | `MAX_DIFF_LINES` | no | `0` (unlimited) | Maximum diff lines before truncation, applied **before** chunking. `0` reviews the whole diff. Set a positive value to keep the first N lines (lexicographic by file path) and append a truncation notice. |
 | `MAX_CHUNK_LINES` | no | `1500` | Per-chunk diff-line budget, applied to the diff **after** [distillation](#how-it-works) has collapsed mechanical repeats/renames/formatting away. When the remaining diff exceeds this, it is split into packages of **whole files** (≤ this many primed lines each), each reviewed in its own model call and the results merged — so a large PR no longer overwhelms a single call and abstains. Module-coupled files (e.g. a Rust `#[path]`/`mod` parent and its child) always share a package, and a single file over the budget rides alone **with its full post-change content attached** as read-only context, so the model never judges a construct from a truncated view. A package whose call fails to produce valid structured output is split and retried in bisecting halves (up to 4 leaves) to isolate just the file(s) actually at fault, instead of writing off the whole package; a leaf that still fails is recorded `unreviewed` in the [coverage ledger](#coverage-ledger) (never a confident approval over unreviewed files). `0` disables chunking (always one call). |
 | `MAX_CHUNKS` | no | `0` | Maximum chunks (= model calls) per review, bounding cost and wall-clock on very large PRs. **`0` (default, changed from `20` prior to `@v7` — see [v7 migration](#v7-migration)) = unlimited.** When set, files beyond the cap are recorded **per-file** as `unreviewed` in the [coverage ledger](#coverage-ledger), which also degrades a would-be `approved` verdict to `error`; the `### Other checks` section of the summary comment also carries a short notice naming them, on top of (not instead of) the per-file ledger rows. |
-| `MAX_WALL_MS` | no | `0` | Soft wall-clock budget, in milliseconds, for the whole review loop. `0` (default) = off, never interrupts a run. When set and exceeded mid-run, packages not yet started are recorded `pending` in the [coverage ledger](#coverage-ledger) instead of being attempted, `reviewed_tree` does **not** advance, and the round becomes resumable — via [`@toolu resume`](#toolu-resume-resuming-a-paused-run), a plain workflow re-run, or automatically on the PR's next push. Checked before every package and before every bisection split; a call already in flight always finishes. |
+| `MAX_WALL_MS` | no | `600000` (10 min) | Shared model-work deadline covering cartography, retries, backoff and token escalation. `0` explicitly disables it. Active requests abort at expiry; recovered findings remain partial and their files stay `unreviewed`, while unstarted packages become `pending`. Neither advances `reviewed_tree`; both resume via [`@toolu resume`](#toolu-resume-resuming-a-paused-run), a workflow re-run, or the next push. Publishing runs outside this budget; use a workflow job timeout (for example 15 minutes) as an outer ceiling. |
 | `REQUEST_TIMEOUT_MS` | no | `180000` (3 min) | Per-attempt model deadline in milliseconds. Each chunk gets up to this long per attempt (retried a few times) before it is aborted and the chunk abstains (`This operation was aborted`). Raise it for slow/large models, lower it to fail faster. A non-positive value falls back to the default. |
 | `TOKEN` | no | `${{ github.token }}` | GitHub token for posting and editing comments. |
 | `APP_ID` | no | — | GitHub App id. Set together with `APP_PRIVATE_KEY` to post as a custom-branded App (`Toolu — Code Review`) instead of `github-actions[bot]`. Both must be set or the action falls back to the default identity. See [Custom identity](#custom-identity-github-app). |
 | `APP_PRIVATE_KEY` | no | — | GitHub App private key — raw PEM **or** base64-encoded PEM (auto-decoded). Pair with `APP_ID`. Pass via a secret; never inline. Used only to mint a short-lived installation token — never logged. |
-| `TRIGGER_PHRASE` | no | `@toolu` | Mention prefix for the bot's two comment commands: `@toolu review [focus on …]` re-triggers a review (requires the workflow to also listen on `issue_comment` — see [@mention re-trigger](#mention-re-trigger)), and `@toolu dismiss` in a reply on one of the bot's inline threads settles that finding (see [Dismissing a finding](#dismissing-a-finding-without-resolving-the-thread)). |
+| `TRIGGER_PHRASE` | no | `@toolu` | Mention prefix for the bot's two comment commands: `@toolu review [focus on …]` re-triggers a review (requires the workflow to also listen on `issue_comment` — see [@mention re-trigger](#mention-re-trigger)), and `@toolu dismiss` in a reply on one of the bot's inline threads settles that finding (see [Dismissing a finding](#dismissing-a-finding-without-resolving-the-thread); the label follows on the next review, or at once with the [settle workflow](#settling-findings-without-a-re-review)). |
 | `MIN_TRIGGER_PERMISSION` | no | `write` | Minimum repo permission a commenter needs to trigger a review via `@mention` **or** dismiss a finding on a bot thread: `write` or `admin`. The check fails closed (denied on any error). |
 | `BOT_NAME` | no | `Toolu — Code Review` | Display name shown in the comment body header. |
 | `BOT_LOGO_URL` | no | `…/code-review/assets/logo.png` | Logo image shown in the comment body header. |
@@ -676,7 +899,7 @@ resolution without posting the note again.
 | `VERBOSITY` | no | `compact` | Verdict-comment shape: `compact` (default) collapses the checklist to one line and renders recap buckets as `path:line` refs; `full` restores the multi-line checklist and inline recap text. Findings, the `### Findings` heading, and the state marker are identical in both. An unrecognized value warns and falls back to `compact`. See [Example verdict](#example-verdict). |
 | `RUN_SECRET_SCAN` | no | `true` | Run the deterministic secret scan (gitleaks) before the LLM review; its findings feed the LLM as triage context and upload to Code Scanning. See [Deterministic checks](#deterministic-checks). |
 | `RUN_SAST` | no | `true` | Run the deterministic SAST pass (Opengrep) before the LLM review; same flow as above. |
-| `SAST_RULES` | no | `p/typescript` | Opengrep rule config(s) for the SAST pass (comma-separated). |
+| `SAST_RULES` | no | `p/typescript` | Opengrep rule config(s) for the SAST pass (comma-separated). TypeScript only out of the box — multi-language repos should broaden this (e.g. `p/javascript,p/typescript` or `p/default`). |
 | `TOOLU_API_KEY` | no | `` | toolu.sh org API token (`toolu_…`) enabling review-run reporting to the platform. Empty (default) disables reporting. Only finding metadata is sent — never code, text, suggestions, or quoted lines. Requires `INLINE_COMMENTS: true`. See [Platform reporting](#platform-reporting). |
 | `TOOLU_API_URL` | no | `https://api.toolu.sh` | Base URL of the toolu.sh API. Override only for a self-hosted platform. |
 
@@ -717,7 +940,7 @@ mapping.
 Use outputs in downstream workflow steps. Note that once the action **fails** the job (see [Blocking merges](#blocking-merges)), later steps that read these outputs need `if: always()` to run at all:
 
 ```yaml
-- uses: falconiere/toolu-ghactions/code-review@v4
+- uses: falconiere/toolu-ghactions/code-review@v8
   id: review
   with:
     API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -729,11 +952,57 @@ Use outputs in downstream workflow steps. Note that once the action **fails** th
 
 By default (`FAIL_ON: changes`) the action **fails its own job** when the bot's verdict is `changes` — the check turns red, the verdict comment and label are still posted. To make that red check actually **block a merge**, mark this action's check as a **required status check** in the repository's branch-protection rules (Settings → Branches). Without that, the red check is visible but advisory.
 
+`changes` requires at least one surviving actionable finding. Explicit "No findings" and recognized praise-only comments are removed before the verdict is settled. A finding whose `quoted_line` is not at its cited line (a quote may run onto adjacent wrapped lines) is dropped like any other unverifiable claim: the file still counts as reviewed, and the comment notes how many findings were dropped. Only when findings carry no quote at all and nothing else survives for a file does that file remain unreviewed, making the verdict `error` ("Review incomplete — source evidence") rather than a request for changes. A model response that requests changes without any supporting finding is also `error` because the action cannot establish an actionable verdict. Under the default `FAIL_ON: changes`, these `error` verdicts do not fail the job; use `FAIL_ON: changes,error` to block incomplete reviews too. When a model's only findings are recognized as non-actionable and coverage is complete, the verdict is `approved`.
+
 - `FAIL_ON: changes` (default) — block when the bot requests changes.
 - `FAIL_ON: changes,error` — also block when the review could not run (provider error/timeout). Safer, but a transient failure reds the check until re-run.
 - `FAIL_ON: none` — never fail on a verdict; the review stays purely advisory (the pre-4.x behavior). You can still gate yourself with `if: steps.review.outputs.verdict == 'changes'`.
 
 The gate governs the verdict only; a thrown infra error fails the job regardless of `FAIL_ON`. A `skip` (non-trigger event) never blocks.
+
+### Advisory findings below a severity threshold
+
+`FAIL_ON` makes the *job* advisory for a verdict, but with `merge-gate` (or any
+branch-protection rule requiring the `merge-approved` label) the *label* is what
+actually controls mergeability — and by default any surviving finding, even a
+`low` or `nit`, withholds `merge-approved`. Set `APPROVE_BELOW` to let lower
+severities stay advisory for the label too, independently of `FAIL_ON`:
+
+```yaml
+- uses: falconiere/toolu-ghactions/code-review@v8
+  with:
+    API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    FAIL_ON: none          # job stays green regardless of verdict
+    APPROVE_BELOW: high    # merge-approved label withheld only for high/blocker
+```
+
+With `APPROVE_BELOW: high`, a review whose only findings are `medium`, `low`, or
+`nit` still sets the `merge-approved` label — a single `high` or `blocker`
+finding, or an incomplete/partial review, always withholds it regardless of the
+threshold. The comment body, `outputs.verdict`, and `FAIL_ON`'s exit-code gate
+are unaffected — `APPROVE_BELOW` changes only the label.
+
+## v8 migration
+
+The original `@v8` release was a **breaking change**: the three native vendor backends were removed and
+`PROVIDER` accepted only `openrouter`. Custom endpoint support now adds
+`openai-compatible` while preserving that default. The review itself is unchanged
+— same pipeline, same checklist, same comment shape, same input names — but two
+behaviors move with the backends: the `API_KEY` a workflow must supply, and how an
+empty budget-cut response is retried. Both are in the table below; read it rather
+than assuming a pure input rename.
+
+| What changed | Detail |
+|---|---|
+| `PROVIDER` values | `deepseek`, `minimax`, `kimi` and `moonshot` are **rejected**. The action fails with a config error pointing you at [openrouter.ai/models](https://openrouter.ai/models) to find the model's id — it never composes one for you, and never silently reroutes, because the vendor key in `API_KEY` would only 401 mid-review. `openrouter` remains the default; use `openai-compatible` with `BASE_URL` for a custom API. |
+| `MODEL_ID` | For OpenRouter, use a namespaced `<vendor>/<model>` id. A bare native id **warns** at input-read time; the run proceeds and fails at the first model call if the id is wrong. Custom endpoints require an explicit model id served by that endpoint. See [Native vendor APIs (removed)](#native-vendor-apis-removed) for the OpenRouter mapping. |
+| `API_KEY` | For OpenRouter, workflows passing `secrets.DEEPSEEK_API_KEY` / `MINIMAX_API_KEY` / `KIMI_API_KEY` must swap in `secrets.OPENROUTER_API_KEY`. For a custom endpoint, supply its own Bearer key if it requires authentication. |
+| Empty-budget retries | A response that burned the whole `MAX_TOKENS` budget on hidden reasoning and returned **no content** is no longer retried at a doubled budget — reasoning is off on OpenRouter (`reasoning: {effort: "none"}`), so that shape means the chosen model ignored the switch and a larger budget only buys more of it. A truncation that **did** produce partial output still escalates exactly as before. If you pin a model that reasons unconditionally, raise `MAX_TOKENS` or lower `MAX_CHUNK_LINES` yourself. |
+
+To adopt `@v8`: bump the pin to
+`falconiere/toolu-ghactions/code-review@v8`, drop any `PROVIDER` line naming a
+removed vendor (or set it to `openrouter`), namespace `MODEL_ID`, and point
+`API_KEY` at your OpenRouter key. The examples throughout this README pin `@v8` already.
 
 ## v7 migration
 
@@ -745,7 +1014,9 @@ The gate governs the verdict only; a thrown infra error fails the job regardless
 | Comment shape | The sticky comment gains four new sections — `### Coverage`, `### Repeated findings`, `### Unanchored findings`, `### Findings GitHub rejected inline` — see [Coverage ledger](#coverage-ledger), [Finding clustering](#finding-clustering), and [Inline comments & suggestions](#inline-comments--suggestions). |
 | Prompt bytes | The user prompt's block order changed (the shared prefix — system, codebase overview, project rules, brief, prior threads — now extends further before the per-package blocks, for prompt-cache efficiency), so prompt byte counts differ from `@v6` even on an identical diff. The review's substance is unaffected. |
 | Inline anchoring | The `subject_type: "file"` fallback is **gone** — a finding on a file GitHub's own diff can't anchor a comment to is never posted as a file-level comment. It appears in the sticky comment's `### Unanchored findings` section instead. See [Inline comments & suggestions](#inline-comments--suggestions). |
-| New input | `MAX_WALL_MS` — soft wall-clock budget, resumable via [`@toolu resume`](#toolu-resume-resuming-a-paused-run). See [Inputs](#inputs). |
+| Runtime budget | `MAX_WALL_MS` — now defaults to a shared ten-minute model-work deadline (including active calls), resumable via [`@toolu resume`](#toolu-resume-resuming-a-paused-run). Set `0` to explicitly opt out. See [Inputs](#inputs). |
+| Confidence floor | `MIN_CONFIDENCE` now applies to every severity, including blocker/high. Workflows that relied on the former severity bypass will no longer receive below-floor findings: `high` drops medium/missing confidence, while `medium` retains medium confidence but still drops missing confidence. |
+| Source evidence and Top-N | Fresh LLM findings require a non-empty quote contained in the cited source line; the former reverse-containment tolerance is removed. Unsupported evidence marks the affected file unreviewed. Top-N is derived from surviving findings, not the model's independent `top_must_fix` prose. |
 
 No workflow YAML changes are required to adopt `@v7` — bump the pinned ref (`falconiere/toolu-ghactions/code-review@v7`) and the new behavior applies on the next run. If any downstream tooling parses the sticky comment's markdown directly (rather than the machine-readable verdict label `pr-babysit` uses), re-check it against the new section shapes above; the verdict label, checklist line, and `### Findings` block are unchanged.
 
@@ -767,9 +1038,8 @@ It was rewritten from the previous Dockerized bash action; there is **no Docker 
 - **Fixes land on merge.** Because consumers run the checked-out ref directly
   (no image to rebuild and re-push to a registry), a fix reaches the action the moment
   it merges — no release required.
-- **Single model, one backend at a time.** The 6-vendor parallel ensemble was dropped
-  in favor of one model — via OpenRouter or a native vendor API (DeepSeek, MiniMax,
-  Kimi), selected with `PROVIDER` — through the Vercel AI SDK. The old ensemble inputs (`PROVIDERS`,
+- **Single model, one backend.** The 6-vendor parallel ensemble was dropped in favor
+  of one model, via OpenRouter, through the Vercel AI SDK. The old ensemble inputs (`PROVIDERS`,
   `MERGE_STRATEGY`, `FALLBACK_MODEL`, `REVIEW_MODE`, `ENFORCE_JSON_SCHEMA`) and the
   split key/model inputs (`OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `MODEL`) were
   [removed in v4](#removed-in-v4-migration).
@@ -818,10 +1088,11 @@ package-layer, which folds in any bisection retries), findings raw vs. clustered
 coverage-status counts, marker bytes vs. the 65 000-char comment-size ceiling, and
 wall time.
 
-It is **excluded from `bun run check`** — evals/ sits outside `tsconfig.json`'s
-`include` and outside oxlint/oxfmt's walk (see `package.json`'s `lint`/`fmt`
-scripts), and vitest's own `include` glob never reaches it either. Its own tests
-live in `evals/__tests__/`, run directly with `bun test evals/__tests__`.
+Its own tests live in `evals/__tests__/` and run via `bun run test:evals`, which
+`bun run check` and CI both invoke. They are `bun:test` specs, not vitest, so
+vitest's own `include` glob never reaches them. The harness **source** is
+typechecked (`tsconfig.json` includes `evals/*.ts`) but still sits outside
+oxlint/oxfmt's walk (see `package.json`'s `lint`/`fmt` scripts).
 
 ```bash
 cd code-review

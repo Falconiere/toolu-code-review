@@ -129,11 +129,14 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 180000;
 /** Ten minutes across all model calls, matching action.yml MAX_WALL_MS. */
 const DEFAULT_MAX_WALL_MS = 600000;
 
-/** A negative wall budget is a typo, never an implicit request for unlimited work. */
+/** A plain base-10 integer — the only numeric shape an integer input may take. */
+const PLAIN_INTEGER = /^-?\d+$/;
+
+/** A negative or malformed wall budget is a typo, never an implicit request for the default. */
 function readWallBudget(): number {
   const raw = core.getInput("MAX_WALL_MS").trim();
-  const parsed = Number(raw);
-  const budget = raw === "" || !Number.isFinite(parsed) ? DEFAULT_MAX_WALL_MS : parsed;
+  if (raw === "") return DEFAULT_MAX_WALL_MS;
+  const budget = PLAIN_INTEGER.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isSafeInteger(budget) || budget < 0) {
     throw new Error("MAX_WALL_MS must be a non-negative integer (0 explicitly disables it).");
   }
@@ -142,13 +145,16 @@ function readWallBudget(): number {
 
 /**
  * Parse a string input as a base-10 integer, falling back to `fallback` for an
- * empty or non-numeric value (mirrors the bash `${VAR:-default}` + arithmetic).
+ * empty value. A non-empty value that is not a plain integer THROWS: parseInt read a
+ * numeric prefix, so `300s` became 300ms and `abc` became 0 (= unlimited).
  */
 function intInput(name: string, fallback: number): number {
   const raw = core.getInput(name).trim();
   if (raw === "") return fallback;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) ? n : fallback;
+  if (!PLAIN_INTEGER.test(raw)) {
+    throw new Error(`${name} must be a base-10 integer (got "${raw}").`);
+  }
+  return Number(raw);
 }
 
 /**
@@ -179,9 +185,14 @@ function validateTimeout(value: number, source: string): number {
   return DEFAULT_REQUEST_TIMEOUT_MS;
 }
 
-/** Read MIN_CONFIDENCE, defaulting to "high"; only "medium" relaxes the floor. */
+/** Read MIN_CONFIDENCE, defaulting to "high"; only "medium" relaxes the floor. An
+ *  unrecognized non-empty value warns and falls back to high, like {@link readVerbosity}. */
 function readMinConfidence(): MinConfidence {
-  return core.getInput("MIN_CONFIDENCE").trim().toLowerCase() === "medium" ? "medium" : "high";
+  const raw = core.getInput("MIN_CONFIDENCE").trim().toLowerCase();
+  if (raw === "" || raw === "high") return "high";
+  if (raw === "medium") return "medium";
+  core.warning(`MIN_CONFIDENCE="${raw}" is not "high" or "medium"; falling back to high.`);
+  return "high";
 }
 
 /**
@@ -217,13 +228,9 @@ export const DEFAULT_TRIGGER_PHRASE = "@toolu";
 
 /**
  * Parse TRIGGER_PHRASE: trimmed, falling back to {@link DEFAULT_TRIGGER_PHRASE} when
- * empty. PURE (no `core.getInput`) on purpose — gate/settleCheckCli.ts is a node-type
- * action, which gets no argv and reads its inputs off `process.env` as `INPUT_*`, so
- * it cannot go through `readInputs()` and used to hand-duplicate this default. One
- * parser, two call sites: the merge-gate recompute can no longer drift from the
- * review run on which phrase settles a finding.
+ * empty.
  */
-export function parseTriggerPhrase(raw: string): string {
+function parseTriggerPhrase(raw: string): string {
   return raw.trim() || DEFAULT_TRIGGER_PHRASE;
 }
 
@@ -234,10 +241,9 @@ export function parseTriggerPhrase(raw: string): string {
  * {@link readVerbosity} and {@link readRulesRef} use — rather than silently failing
  * OPEN to the looser gate, which is how a `MIN_TRIGGER_PERMISSION: "maintain"` typo
  * would quietly let any write-level commenter dismiss a blocker. An empty value is
- * the normal default and stays silent. Pure, for the same reason
- * {@link parseTriggerPhrase} is.
+ * the normal default and stays silent.
  */
-export function parseMinTriggerPermission(raw: string): "write" | "admin" {
+function parseMinTriggerPermission(raw: string): "write" | "admin" {
   const token = raw.trim().toLowerCase();
   if (token === "" || token === "write") return "write";
   if (token === "admin") return "admin";

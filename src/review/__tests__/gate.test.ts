@@ -1,4 +1,4 @@
-// gate.test.ts — real-data unit tests for the FAIL_ON merge-gate policy. Inputs
+// gate.test.ts — real-data unit tests for the FAIL_ON policy. Inputs
 // are real CSV strings; core.warning is spied (a platform double, not mock data)
 // to assert the dropped-token diagnostic without writing to the run log.
 import { describe, it, expect, vi, afterEach } from "vitest";
@@ -52,12 +52,24 @@ describe("parseFailOn", () => {
     expect(warn).toHaveBeenCalledTimes(1);
 
     warn.mockClear();
-    expect(parsed("approved")).toEqual([]);
+    expect(parsed("none,approved")).toEqual([]);
     expect(warn).toHaveBeenCalledTimes(1);
+  });
 
-    warn.mockClear();
-    expect(parsed("skip")).toEqual([]);
-    expect(warn).toHaveBeenCalledTimes(1);
+  it("throws when every token is unknown, so a typo cannot turn the gate off", () => {
+    vi.spyOn(core, "warning").mockImplementation(() => "");
+    for (const raw of ["chages", "approved", "skip", "bogus, nonsense"]) {
+      expect(() => parseFailOn(raw)).toThrow(/FAIL_ON.*'changes', 'error', or 'none'/);
+    }
+    expect(() => parseFailOn("chages")).toThrow(/chages/);
+  });
+
+  it("accepts space- and semicolon-separated lists", () => {
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => "");
+    expect(parsed("changes error")).toEqual(["changes", "error"]);
+    expect(parsed("changes;error")).toEqual(["changes", "error"]);
+    expect(parsed("changes, error;\nnone")).toEqual(["changes", "error"]);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("AC-5: 'none' combined with a blockable token → just the blockable one, no warning", () => {

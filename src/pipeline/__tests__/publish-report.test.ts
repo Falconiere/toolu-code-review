@@ -195,7 +195,7 @@ it("does not resurrect dismissed clusters or model commentary in the posted summ
         findings: stamped,
         other_checks: "Fix all the invented barrels.",
       },
-      priorThreads: stamped.map((f) => thread({ ...f, isResolved: true })),
+      priorThreads: stamped.map((f) => thread({ ...f, isResolved: true, dismissal: "resolved" })),
       ledger: {
         entries: Object.fromEntries(stamped.map((f) => [f.path, { status: "reviewed" as const }])),
       },
@@ -406,7 +406,7 @@ describe("publish — cluster members are expanded on BOTH sides of the report p
 // fingerprint — so a `low` exemplar ranked below a `medium` threshold and flipped the
 // chip to merge-approved while a `blocker` member of its own cluster survived.
 // review/recompute.ts already expanded to members before this same gate, which is why
-// the review path and the merge-gate recompute disagreed about identical commit state.
+// the review path and the settle recompute disagreed about identical commit state.
 describe("publish — the APPROVE_BELOW label reads cluster MEMBERS, not just the exemplar", () => {
   const TEXT = "Unwrap on a Result that can be an Err in this handler.";
   const PATHS = ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"];

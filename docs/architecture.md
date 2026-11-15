@@ -113,8 +113,7 @@ header for the full story, this is just the index).
   the last completed round's stored findings minus the ones settled on their
   threads (`dropSettled`, cluster-aware), labelled by `resolveLabelVerdict`.
   Fails closed on no state, an incomplete round, a stale head, or a last
-  verdict other than `changes`. Shared with merge-gate's recompute (#123) via
-  `pipeline/settleEvaluation.ts`.
+  verdict other than `changes`.
 - **`settledBody.ts`** — patches the sticky's verdict line, `Settled` note
   and label line after a settle pass; the marker is never touched, and an
   unrecognised body yields `null` (write nothing).
@@ -152,8 +151,7 @@ header for the full story, this is just the index).
 - **`settleEvaluation.ts`** — `evaluateSettle()`, the read-only half of the
   settle recompute: trusts only a Bot-authored, not-in-progress sticky and
   that bot's own threads, checks the LIVE head, classifies dismissals, then
-  runs `recompute.ts`. Shared by `dismissRecompute.ts` and merge-gate's
-  recompute (`src/gate/`), so both agree on what "settled" means.
+  runs `recompute.ts`. Used by `dismissRecompute.ts`.
 - **`dismissRecompute.ts`** — the settle pass a reply on a bot thread runs
   (`pull_request_review_comment`): `evaluateSettle()`, then flips
   `request-changes` → `merge-approved` via `settledBody.ts` + the label —
@@ -163,14 +161,6 @@ header for the full story, this is just the index).
   dropped findings can be rendered into it), and the toolu.sh report runs
   **after** the inline mutations (so it never claims a fix GitHub didn't
   accept).
-
-### `src/gate/`
-- **`settleCheck.ts` / `settleCheckCli.ts` / `settleCheckMain.ts`** —
-  merge-gate's read-only settle recompute (#123), bundled by `build.mjs` to
-  `../merge-gate/recompute/index.cjs` (a nested node24 action the merge-gate
-  composite runs before its bash gate). `evaluateSettle()` flattened into
-  step outputs (`outcome`, `reason`, `verdict`, `settled`, `total`); no model
-  call, no GitHub writes, and every failure is `outcome=unchanged`.
 
 ### `src/github/`
 - **`review.ts`** — `postInlineReview()`: builds inline comments, validates
@@ -191,15 +181,17 @@ header for the full story, this is just the index).
 - **`reviewWithModel.ts`** — the OpenRouter `generateObject` call
   (timeout/abort, retries, budget escalation, salvage, abstain). A failed
   call's error result carries `failure: "schema" | "transport" | "timeout"`
-  so callers can tell a bisectable failure from one that isn't.
+  so callers can tell a bisectable failure from one that isn't. Reviews stream
+  through `streamVerdict.ts`, which rejects a response whose JSON never closed.
 - **`merge.ts`** — combines a chunked review's per-package `ProviderResult`s
   into one: partial failure keeps every success and only reports `error`
   when **every** package failed.
 
 ### `src/state.ts`
-- The sticky-comment marker: `fingerprint()`/`normText` (byte-compat,
-  **never modified**), `encodeMarker`/`decodeMarker` (gzip+base64,
-  fail-safe on a corrupt or hostile marker), and `diffState()` — the *sole*
+- The sticky-comment marker: `fingerprint()`/`normText` (ASCII-only text hashes
+  byte-identically to every earlier release; Unicode letters and digits are kept so
+  non-Latin findings stay distinct), `encodeMarker`/`decodeMarker` (gzip+base64,
+  fail-safe on a corrupt or hostile marker; only a marker that ends the body is read), and `diffState()` — the *sole*
   carrier of every marker field into `next_state`; a field not threaded
   through `DiffInput` here is dropped on the next round. See
   [Marker contract](#marker-contract-statets) below.
@@ -235,6 +227,7 @@ reading an old marker both work) carries:
 |---|---|---|
 | `findings` | every run | This round's full finding list (fingerprint-stamped), post-cluster-expansion. |
 | `history` | **complete** runs only | Capped at the last 10 entries; a partial run appends **nothing**, so a resumed round never burns a `MAX_ROUNDS` slot. |
+| `rounds` | **complete** runs only | Monotonic count of complete rounds — the `MAX_ROUNDS` counter, uncapped (unlike `history`). Read through `completedRounds()`, which falls back to `history.length` for a marker written before this field. |
 | `reviewed_sha` | **complete** runs only | Full head sha; drives the **line-level** `IncrementalScope` (`sinceChangedLines`, `pipeline/git.ts`). |
 | `reviewed_tree` | **complete** runs only | Root **tree** sha; drives the **file-set** scope (`resolveTreeScope`, `pipeline/scope.ts`). Constant-size regardless of PR size. |
 | `unreviewed_paths` | every run (threaded straight from the caller) | Attempted-and-failed paths this round; empty → **omitted** (an absent field is how a completing round clears the prior round's exceptions). |

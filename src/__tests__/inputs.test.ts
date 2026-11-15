@@ -4,12 +4,7 @@ import * as core from "@actions/core";
 // below needs this spy-mode mock: every export stays the real implementation, wrapped
 // in a spy that vi.spyOn can then redirect. Nothing about the logger is faked.
 vi.mock(import("@actions/core"), { spy: true });
-import {
-  readInputs,
-  parseMinTriggerPermission,
-  parseTriggerPhrase,
-  DEFAULT_TRIGGER_PHRASE,
-} from "@/inputs.js";
+import { readInputs, DEFAULT_TRIGGER_PHRASE } from "@/inputs.js";
 import { DEFAULT_MODEL } from "@/llm/providers.js";
 
 /** Set an action input as @actions/core reads it (process.env.INPUT_<NAME>). */
@@ -59,9 +54,45 @@ describe("REQUEST_TIMEOUT_MS", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("not a positive timeout"));
   });
 
-  it("falls back to the default on a non-numeric value", () => {
-    setInput("REQUEST_TIMEOUT_MS", "abc");
+  it("falls back to the default on an empty value", () => {
+    setInput("REQUEST_TIMEOUT_MS", "  ");
     expect(readInputs().requestTimeoutMs).toBe(180000);
+  });
+});
+
+describe("malformed integer inputs fail at start, naming the input", () => {
+  // parseInt read a numeric PREFIX: "300s" became 300ms, "16k" 16 tokens, "abc" 0 (= unlimited).
+  it.each([
+    ["REQUEST_TIMEOUT_MS", "300s"],
+    ["REQUEST_TIMEOUT_MS", "3e5"],
+    ["MAX_TOKENS", "16k"],
+    ["MAX_FILES", "5o"],
+    ["MAX_FILES", "abc"],
+    ["MAX_DIFF_LINES", "1.5"],
+  ])("%s=%s throws", (name, value) => {
+    setInput(name, value);
+    expect(() => readInputs()).toThrow(new RegExp(`${name}.*"${value}"`));
+  });
+
+  it("an empty value still takes the default", () => {
+    setInput("MAX_FILES", "");
+    expect(readInputs().maxFiles).toBe(0);
+  });
+});
+
+describe("MIN_CONFIDENCE", () => {
+  it("defaults to high and accepts medium", () => {
+    expect(readInputs().minConfidence).toBe("high");
+    setInput("MIN_CONFIDENCE", "Medium");
+    expect(readInputs().minConfidence).toBe("medium");
+  });
+
+  it("warns once on an unrecognised value and falls back to high", () => {
+    setInput("MIN_CONFIDENCE", "low");
+    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
+    expect(readInputs().minConfidence).toBe("high");
+    const hits = warn.mock.calls.filter(([m]) => String(m).includes("MIN_CONFIDENCE"));
+    expect(hits).toHaveLength(1);
   });
 });
 
@@ -86,9 +117,14 @@ describe("MAX_WALL_MS", () => {
     expect(readInputs().maxWallMs).toBe(600000);
   });
 
-  it("falls back to ten minutes on a non-numeric value", () => {
-    setInput("MAX_WALL_MS", "abc");
+  it("falls back to ten minutes on an empty value", () => {
+    setInput("MAX_WALL_MS", "");
     expect(readInputs().maxWallMs).toBe(600000);
+  });
+
+  it.each(["abc", "600s", "3e5"])("rejects %s instead of silently using the default", (value) => {
+    setInput("MAX_WALL_MS", value);
+    expect(() => readInputs()).toThrow("MAX_WALL_MS must be a non-negative integer");
   });
 
   it("allows an explicit zero to disable the budget", () => {
@@ -108,7 +144,7 @@ describe("MAX_WALL_MS", () => {
 
   it("does not interpret malformed zero text as an explicit opt-out", () => {
     setInput("MAX_WALL_MS", "0ms");
-    expect(readInputs().maxWallMs).toBe(600000);
+    expect(() => readInputs()).toThrow("MAX_WALL_MS must be a non-negative integer");
   });
 });
 
@@ -257,32 +293,6 @@ describe("TRIGGER_PHRASE", () => {
   it("falls back to the default on a whitespace-only value", () => {
     setInput("TRIGGER_PHRASE", "   ");
     expect(readInputs().triggerPhrase).toBe(DEFAULT_TRIGGER_PHRASE);
-  });
-});
-
-// gate/settleCheckCli.ts is a node-type action: it gets no argv, so it reads raw
-// `INPUT_*` strings off process.env and cannot go through readInputs(). It used to
-// hand-duplicate all three of these defaults, and nothing kept them in sync — if they
-// drifted, the merge-gate recompute and the review run would disagree about which
-// comment settles a finding. Both now call the same pure parsers.
-describe("the merge-gate CLI's raw-env path resolves identically to readInputs()", () => {
-  it("agrees on TRIGGER_PHRASE for the raw, untrimmed string the runner hands it", () => {
-    const raw = "  @review-bot  ";
-    setInput("TRIGGER_PHRASE", raw);
-    // readInputs() goes through core.getInput (which trims); the CLI passes `raw`
-    // straight in. Both must land on the same phrase.
-    expect(parseTriggerPhrase(raw)).toBe(readInputs().triggerPhrase);
-    expect(parseTriggerPhrase("")).toBe(DEFAULT_TRIGGER_PHRASE);
-  });
-
-  it("agrees on MIN_TRIGGER_PERMISSION, including the warned fallback", () => {
-    const warn = vi.spyOn(core, "warning").mockImplementation(() => {});
-    for (const raw of ["admin", "  ADMIN ", "write", "maintain", ""]) {
-      setInput("MIN_TRIGGER_PERMISSION", raw);
-      expect(parseMinTriggerPermission(raw)).toBe(readInputs().minTriggerPermission);
-    }
-    // The typo warns through BOTH paths, so the CLI surfaces it too.
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('is not "write" or "admin"'));
   });
 });
 
